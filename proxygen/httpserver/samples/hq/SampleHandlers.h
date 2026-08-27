@@ -917,6 +917,14 @@ class StaticFileHandler : public BaseSampleHandler {
       return;
     }
     proxygen::HTTPMessage resp = createHttpResponse(200, "Ok");
+    struct stat fileStat;
+    uint64_t fileSize = 0;
+    if (fstat(file_->fd(), &fileStat) == 0) {
+        fileSize = fileStat.st_size;
+        resp.getHeaders().add(proxygen::HTTP_HEADER_CONTENT_LENGTH, folly::to<std::string>(fileSize));
+    } else {
+        LOG(ERROR) << "Could not stat file: " << filepath;
+    }
     maybeAddAltSvcHeader(resp);
     txn_->sendHeaders(resp);
     // use a CPU executor since read(2) of a file can block
