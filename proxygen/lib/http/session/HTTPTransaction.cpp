@@ -15,6 +15,7 @@
 #include <glog/logging.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/RFC2616.h>
+#include <proxygen/lib/http/codec/CodecProtocol.h>
 #include <proxygen/lib/http/codec/webtransport/WebTransportFramer.h>
 #include <proxygen/lib/http/session/HTTPSessionStats.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
@@ -51,11 +52,6 @@ HTTPException stateMachineError(HTTPException::Direction dir, std::string msg) {
 
 inline ErrorCode getDefaultAbortErrorCode(bool isUpstream) {
   return isUpstream ? ErrorCode::CANCEL : ErrorCode::INTERNAL_ERROR;
-}
-
-bool isConnectUdp(const HTTPMessage& msg) noexcept {
-  return msg.getMethod() == HTTPMethod::CONNECT && msg.getUpgradeProtocol() &&
-         *msg.getUpgradeProtocol() == "connect-udp";
 }
 
 auto tryParseContentLength(const std::string& cl, const HTTPTransaction& txn) {
@@ -131,9 +127,8 @@ HTTPTransaction::HTTPTransaction(
       enableLastByteFlushedTracking_(false),
       wtConnectStream_(false),
       egressHeadersDelivered_(false),
-      has1xxResponse_(false),
       deferredNoError_(false),
-      upgraded_(false),
+      upgraded_(UpgradeStatus::None),
       idleTimeout_(defaultIdleTimeout),
       timer_(timer),
       setIngressTimeoutAfterEom_(setIngressTimeoutAfterEom),
@@ -221,14 +216,23 @@ void HTTPTransaction::onIngressHeadersComplete(
               : IngressSmEvent::onNonFinalHeaders)) {
     return;
   }
-  if (msg->isRequest()) {
-    auto method = msg->getMethod();
-    headRequest_ = (method == HTTPMethod::HEAD);
-    upgraded_ = (method == HTTPMethod::CONNECT);
-    wtConnectStream_ = HTTPWebTransport::isConnectMessage(*msg);
-    connectUdpStream_ = isConnectUdp(*msg);
+  checkForUpgrade(*msg);
+  headRequest_ |= (msg->isRequest() && msg->getMethod() == HTTPMethod::HEAD);
+  // An HTTP/1.1 request carrying both Transfer-Encoding and Content-Length has
+  // ambiguous framing and is a request-smuggling vector (RFC 9112 §6.3.3).
+  // Count each such request so we can measure how often it happens before we
+  // start rejecting it.
+  if (stats_ && isDownstream() && msg->isRequest() &&
+      isHTTP1_1CodecProtocol(transport_.getCodec().getProtocol()) &&
+      msg->getHeaders().exists(HTTP_HEADER_TRANSFER_ENCODING) &&
+      msg->getHeaders().exists(HTTP_HEADER_CONTENT_LENGTH)) {
+    stats_->recordIngressReqWithTEAndCL();
   }
-
+  // Omit upgrade requests (e.g. WebSocket) from the measurement: HTTP/1.1
+  // upgrades use GET and legitimately carry body bytes for the new protocol.
+  ingressGetRequest_ |= (isDownstream() && msg->isRequest() &&
+                         msg->getMethod() == HTTPMethod::GET &&
+                         !msg->getHeaders().exists(HTTP_HEADER_UPGRADE));
   if ((msg->isRequest() && msg->getMethod() != HTTPMethod::CONNECT) ||
       (msg->isResponse() && !headRequest_ &&
        !RFC2616::responseBodyMustBeEmpty(msg->getStatusCode()))) {
@@ -320,6 +324,13 @@ void HTTPTransaction::onIngressBody(unique_ptr<IOBuf> chain, uint16_t padding) {
   auto len = chain->computeChainDataLength();
   if (len == 0) {
     return;
+  }
+
+  if (ingressGetRequest_ && !recordedIngressGetRequestWithBody_) {
+    recordedIngressGetRequestWithBody_ = true;
+    if (stats_) {
+      stats_->recordIngressGetRequestWithBody();
+    }
   }
   if (!validateIngressStateTransition(IngressSmEvent::onBody)) {
     return;
@@ -490,7 +501,7 @@ void HTTPTransaction::onIngressUpgrade(UpgradeProtocol protocol) {
   if (!validateIngressStateTransition(IngressSmEvent::onUpgrade)) {
     return;
   }
-  upgraded_ = true;
+  upgraded_ = UpgradeStatus::Upgraded;
   if (mustQueueIngress()) {
     checkCreateDeferredIngress();
     deferredIngress_->emplace(id_, HTTPEvent::Type::UPGRADE, protocol);
@@ -1008,15 +1019,9 @@ void HTTPTransaction::sendHeadersWithOptionalEOM(const HTTPMessage& headers,
   if (!headers.isRequest() && !isPushed()) {
     lastResponseStatus_ = headers.getStatusCode();
   }
-
-  if (headers.isRequest()) {
-    headRequest_ = (headers.getMethod() == HTTPMethod::HEAD);
-    wtConnectStream_ = HTTPWebTransport::isConnectMessage(headers);
-    connectUdpStream_ = isConnectUdp(headers);
-  } else {
-    has1xxResponse_ = headers.is1xxResponse();
-  }
-
+  checkForUpgrade(headers);
+  headRequest_ |=
+      (headers.isRequest() && headers.getMethod() == HTTPMethod::HEAD);
   if (headers.isResponse() && !headRequest_) {
     const auto& contentLen =
         headers.getHeaders().getSingleOrEmpty(HTTP_HEADER_CONTENT_LENGTH);
@@ -1287,7 +1292,8 @@ size_t HTTPTransaction::sendEOMNow() {
   updateReadTimeout();
   // rst_stream/no_error if downstream egresses eom before ingress eom seen
   deferredNoError_ = transport_.serverEarlyResponseEnabled() &&
-                     isDownstream() && !isIngressEOMSeen() && !isUpgraded();
+                     isDownstream() && !isIngressEOMSeen() &&
+                     !isUpgradeComplete();
 
   nbytes += maybeSendDeferredNoError();
 
@@ -1879,6 +1885,19 @@ void HTTPTransaction::sendCloseWebTransportSessionCapsule(
   if (capsuleData && capsuleData->computeChainDataLength() > 0) {
     sendBody(std::move(capsuleData));
   }
+}
+
+void HTTPTransaction::checkForUpgrade(const HTTPMessage& msg) noexcept {
+  if (msg.isRequest()) {
+    upgraded_ = msg.getMethod() == HTTPMethod::CONNECT ? UpgradeStatus::Pending
+                                                       : UpgradeStatus::None;
+    wtConnectStream_ = HTTPWebTransport::isConnectMessage(msg);
+    connectUdpStream_ = msg.isConnectUdpReq();
+  } else if (upgraded_ == UpgradeStatus::Pending && msg.isFinal()) {
+    upgraded_ =
+        msg.is2xxResponse() ? UpgradeStatus::Upgraded : UpgradeStatus::None;
+  }
+  VLOG(4) << __func__ << "; upgraded=" << int(upgraded_);
 }
 
 bool HTTPTransaction::hasBytesEventObservers() {

@@ -7,8 +7,11 @@
  */
 
 #include "proxygen/lib/http/coro/client/HTTPCoroConnector.h"
+#include "proxygen/lib/http/coro/client/TLS.h"
 #include <folly/logging/xlog.h>
 #include <proxygen/lib/http/codec/H3EarlyDataHandler.h>
+
+#include "proxygen/lib/http/coro/client/ProxygenCertVerifier.h"
 
 #include "proxygen/lib/http/coro/transport/CoroSSLTransport.h"
 #include "proxygen/lib/http/coro/transport/HTTPConnectAsyncTransport.h"
@@ -18,6 +21,7 @@
 #include "proxygen/lib/http/coro/util/Transport.h"
 #include <fizz/backend/openssl/certificate/CertUtils.h>
 #include <fizz/client/AsyncFizzClient.h>
+#include <fizz/protocol/CertificateVerifier.h>
 #include <fizz/protocol/DefaultCertificateVerifier.h>
 #include <folly/FileUtil.h>
 #include <folly/SocketAddress.h>
@@ -48,14 +52,6 @@ using namespace fizz;
 using namespace fizz::client;
 using namespace proxygen;
 using namespace proxygen::coro;
-
-// if the sni is an ip addr format or an empty string, we return folly::none
-folly::Optional<std::string> getValidSni(std::string_view sni) {
-  if (sni.empty() || folly::IPAddress::validate(sni)) {
-    return folly::none;
-  }
-  return std::string(sni);
-}
 
 // default conn & stream fc are ~32MB & ~2MB respectively
 constexpr size_t kDefaultConnFlowControl = 1u << 25;
@@ -203,7 +199,7 @@ void setupCodec(HTTPCodec& codec,
   }
 }
 
-void setupSession(HTTPCoroSession* session,
+void setupSession(CoroSessionHandle session,
                   const HTTPCoroConnector::SessionParams& sessionParams) {
   // default conn fc window to ~32MB
   session->setConnectionFlowControl(
@@ -244,7 +240,30 @@ folly::coro::Task<std::unique_ptr<CoroTransportIf>> connectFizz(
       connParams.serverName.empty() ? connectAddr.getAddressStr()
                                     : connParams.serverName);
 
-  auto sni = getValidSni(connParams.serverName);
+  std::optional<ExpectedIdentity> expectedIdentity;
+  folly::Optional<std::string> sendSNI;
+  // connParams.serverName reflects the DNS hostname for this connection.
+  // If empty, client is connecting by IP address.
+  // If non empty, client is connecting by DNS hostname, and will send SNI.
+  if (connParams.serverName.empty()) {
+    expectedIdentity = ExpectedIdentity::expectIP(connectAddr.getIPAddress());
+    sendSNI = folly::none;
+  } else {
+    expectedIdentity = ExpectedIdentity::expectDNS(connParams.serverName);
+    sendSNI = connParams.serverName;
+  }
+  auto policy = connParams.insecureSkipIdentityValidation
+                    ? ValidationPolicy::Logging
+                    : ValidationPolicy::Enforcing;
+  if (!connParams.fizzContextAndVerifier.fizzCertVerifier) {
+    throw std::invalid_argument(
+        "HTTPCoroConnector::connectFizz requires a non-null fizzCertVerifier.");
+  }
+  auto proxygenVerifier =
+      makeVerifier(connParams.fizzContextAndVerifier.fizzCertVerifier,
+                   std::move(expectedIdentity.value()),
+                   policy,
+                   connParams.certVerifyLogFn);
   if (connectStream) {
     folly::AsyncTransportWrapper::UniquePtr asyncTransport{
         new HTTPConnectAsyncTransport(std::move(connectStream))};
@@ -252,8 +271,8 @@ folly::coro::Task<std::unique_ptr<CoroTransportIf>> connectFizz(
         new AsyncFizzClient(std::move(asyncTransport),
                             connParams.fizzContextAndVerifier.fizzContext));
     fizzClient->connect(&cb,
-                        connParams.fizzContextAndVerifier.fizzCertVerifier,
-                        std::move(sni),
+                        proxygenVerifier,
+                        std::move(sendSNI),
                         pskIdentity,
                         folly::none, /* echConfigs */
                         timeoutMs /* timeout */);
@@ -262,8 +281,8 @@ folly::coro::Task<std::unique_ptr<CoroTransportIf>> connectFizz(
         eventBase, connParams.fizzContextAndVerifier.fizzContext));
     fizzClient->connect(connectAddr,
                         &cb,
-                        connParams.fizzContextAndVerifier.fizzCertVerifier,
-                        std::move(sni),
+                        proxygenVerifier,
+                        std::move(sendSNI),
                         pskIdentity,
                         timeoutMs, /* total timeout */
                         timeoutMs, /* tcpConnectTimeout */
@@ -297,7 +316,16 @@ folly::coro::Task<std::unique_ptr<CoroTransportIf>> connectTLS(
     wangle::TransportInfo& tinfo) {
 
   auto sslSession = getSslSession(connParams);
-  auto sni = getValidSni(connParams.serverName);
+  folly::Optional<std::string> sendSNI;
+  // connParams.serverName reflects the DNS hostname for this connection.
+  // If empty, client is connecting by IP address.
+  // If non empty, client is connecting by DNS hostname, and will send SNI.
+  if (connParams.serverName.empty()) {
+    sendSNI = folly::none;
+  } else {
+    sendSNI = connParams.serverName;
+  }
+
   if (connectStream) {
     auto sslTransport = std::make_unique<CoroSSLTransport>(
         std::make_unique<HTTPConnectTransport>(std::move(connectStream)),
@@ -306,7 +334,7 @@ folly::coro::Task<std::unique_ptr<CoroTransportIf>> connectTLS(
       sslTransport->setSSLSession(std::move(sslSession));
     }
 
-    co_await sslTransport->connect(std::move(sni), timeoutMs);
+    co_await sslTransport->connect(std::move(sendSNI), timeoutMs);
     co_await folly::coro::co_safe_point;
     initTransportInfoFromCoroSSLTransport(tinfo, *sslTransport);
     if (!sslTransport->getSSLSessionReused() && connParams.sslSessionManager) {
@@ -321,7 +349,9 @@ folly::coro::Task<std::unique_ptr<CoroTransportIf>> connectTLS(
 
       sslSock->setSSLSession(std::move(sslSession));
     }
-    sslSock->setServerName(std::move(sni).value_or(""));
+    if (sendSNI.hasValue()) {
+      sslSock->setServerName(std::move(sendSNI).value());
+    }
     sslSock->forceCacheAddrOnFailure(true);
     ConnectCB cb;
     sslSock->connect(&cb,
@@ -364,7 +394,7 @@ class QuicConnectCB
   }
 
   folly::exception_wrapper quicException;
-  HTTPCoroSession* session{nullptr};
+  CoroSessionHandle session{nullptr};
 
  private:
   void quicConnectErr(folly::exception_wrapper ex) noexcept {
@@ -411,8 +441,8 @@ class QuicConnectCB
     session = HTTPCoroSession::makeUpstreamCoroSession(
         std::move(quicClient_), std::move(codec), std::move(tinfo_));
     setupSession(session, sessionParams_);
-    static_cast<HTTPQuicCoroSession*>(session)->setEarlyDataHandler(
-        std::move(earlyDataHandler_));
+    static_cast<HTTPQuicCoroSession*>(session.get())
+        ->setEarlyDataHandler(std::move(earlyDataHandler_));
     connectSuccess();
   }
   std::shared_ptr<quic::QuicClientTransport> quicClient_;
@@ -424,7 +454,7 @@ class QuicConnectCB
   std::unique_ptr<H3EarlyDataHandler> earlyDataHandler_;
 };
 
-folly::coro::Task<HTTPCoroSession*> connectQuic(
+folly::coro::Task<CoroSessionHandle> connectQuic(
     folly::EventBase* eventBase,
     folly::SocketAddress connectAddr,
     std::chrono::milliseconds timeoutMs,
@@ -445,7 +475,7 @@ folly::coro::Task<HTTPCoroSession*> connectQuic(
 
   auto hostname = connParams.serverName.empty() ? connectAddr.getAddressStr()
                                                 : connParams.serverName;
-  quicClient->setHostname(std::move(hostname));
+  quicClient->setHostname(hostname);
   quicClient->addNewPeerAddress(
       quic::fromFollySocketAddress<quic::SocketAddress>(connectAddr));
   if (connParams.bindAddr != folly::AsyncSocket::anyAddress()) {
@@ -506,7 +536,7 @@ folly::coro::Task<HTTPCoroSession*> connectQuic(
   co_return cb.session;
 }
 
-folly::coro::Task<HTTPCoroSession*> connectImpl(
+folly::coro::Task<CoroSessionHandle> connectImpl(
     folly::EventBase* evb,
     folly::SocketAddress serverAddr,
     std::unique_ptr<HTTPConnectStream> connectStream,
@@ -518,6 +548,10 @@ folly::coro::Task<HTTPCoroSession*> connectImpl(
 
   folly::Try<std::unique_ptr<CoroTransportIf>> socket;
   bool isSecure = true;
+  std::string userSessionId;
+  if (connectStream) {
+    userSessionId = connectStream->extractUserSessionId();
+  }
   if (connParams.fizzContextAndVerifier.fizzContext) {
     socket = co_await co_awaitTry(connectFizz(
         evb, serverAddr, std::move(connectStream), timeout, connParams, tinfo));
@@ -569,15 +603,32 @@ folly::coro::Task<HTTPCoroSession*> connectImpl(
   }
   auto session = HTTPCoroSession::makeUpstreamCoroSession(
       std::move(*socket), std::move(codec), std::move(tinfo));
+  if (!userSessionId.empty()) {
+    session->setUserSessionId(std::move(userSessionId));
+  }
   setupSession(session, sessionParams);
   co_return session;
+}
+
+static std::vector<std::string> getDefaultCAPath() {
+  if (const char* envPath = std::getenv("PROXYGEN_CORO_CA_PATH");
+      envPath && *envPath) {
+    return {envPath};
+  } else if (const char* curlCABundle = std::getenv("CURL_CA_BUNDLE");
+             curlCABundle && *curlCABundle) {
+    return {curlCABundle};
+  } else if (const char* fallbackPath = getFallbackCAPath();
+             fallbackPath && *fallbackPath) {
+    return {fallbackPath};
+  }
+  return {};
 }
 
 } // namespace
 
 namespace proxygen::coro {
 
-folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::connect(
+folly::coro::Task<CoroSessionHandle> HTTPCoroConnector::connect(
     folly::EventBase* evb,
     folly::SocketAddress serverAddr,
     std::chrono::milliseconds timeout,
@@ -587,7 +638,7 @@ folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::connect(
       evb, std::move(serverAddr), nullptr, timeout, connParams, sessionParams);
 }
 
-folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::happyEyeballsConnect(
+folly::coro::Task<CoroSessionHandle> HTTPCoroConnector::happyEyeballsConnect(
     folly::EventBase* evb,
     folly::SocketAddress primaryAddr,
     folly::SocketAddress fallbackAddr,
@@ -602,7 +653,7 @@ folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::happyEyeballsConnect(
                            const ConnectionParams& connParams,
                            const SessionParams& sessionParams,
                            folly::coro::SharedPromise<void>& failedConnection)
-      -> folly::coro::Task<HTTPCoroSession*> {
+      -> folly::coro::Task<CoroSessionHandle> {
     auto sessionTry =
         co_await folly::coro::co_awaitTry(HTTPCoroConnector::connect(
             evb, std::move(primaryAddr), timeout, connParams, sessionParams));
@@ -623,7 +674,7 @@ folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::happyEyeballsConnect(
          const ConnectionParams& connParams,
          const SessionParams& sessionParams,
          const folly::coro::SharedPromise<void>& failedConnection)
-      -> folly::coro::Task<HTTPCoroSession*> {
+      -> folly::coro::Task<CoroSessionHandle> {
     // Wait for happyEyeballsDelay or until the first attempt fails
     co_await folly::coro::collectAny(
         folly::coro::sleepReturnEarlyOnCancel(happyEyeballsDelay),
@@ -651,8 +702,8 @@ folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::happyEyeballsConnect(
   co_return res.second;
 }
 
-folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::proxyConnect(
-    HTTPCoroSession* proxySession,
+folly::coro::Task<CoroSessionHandle> HTTPCoroConnector::proxyConnect(
+    CoroSessionHandle proxySession,
     HTTPCoroSession::RequestReservation reservation,
     std::string authority,
     bool connectUnique,
@@ -679,7 +730,7 @@ folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::proxyConnect(
                                             sessionParams));
 }
 
-folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector::connect(
+folly::coro::Task<CoroSessionHandle> HTTPCoroConnector::connect(
     folly::EventBase* evb,
     folly::SocketAddress serverAddr,
     std::chrono::milliseconds timeout,
@@ -742,18 +793,29 @@ HTTPCoroConnector::makeFizzClientContext(const TLSParams& params) {
 
 std::shared_ptr<const fizz::CertificateVerifier>
 HTTPCoroConnector::makeFizzCertVerifier(const TLSParams& params) {
-  std::unique_ptr<fizz::DefaultCertificateVerifier> fizzCertVerifier;
-  if (params.caPaths.size() > 0) {
-    Error err;
-    FIZZ_THROW_ON_ERROR(fizz::DefaultCertificateVerifier::createFromCAFiles(
-                            fizzCertVerifier,
-                            err,
-                            fizz::VerificationContext::Client,
-                            params.caPaths),
+  std::vector<std::string> caPaths = params.caPaths;
+  if (caPaths.empty()) {
+    caPaths = getDefaultCAPath();
+  }
+
+  Error err;
+  if (caPaths.empty()) {
+    FIZZ_THROW_ON_ERROR(err.error("HTTPCoroConnector::makeFizzCertVerifier "
+                                  "could not find suitable trust anchor store"),
                         err);
   }
-  return static_cast<std::shared_ptr<const fizz::CertificateVerifier>>(
-      std::move(fizzCertVerifier));
+
+  std::unique_ptr<fizz::DefaultCertificateVerifier> verifier;
+  if (auto result = fizz::DefaultCertificateVerifier::createFromCAFiles(
+          verifier, err, fizz::VerificationContext::Client, caPaths);
+      result != Status::Success) {
+    FIZZ_THROW_ON_ERROR(err.error(fmt::format(
+                            "HTTPCoroConnector::makeFizzCertVerifier failed to "
+                            "initialize TLS trust anchors: {}",
+                            err.msg())),
+                        err);
+  }
+  return verifier;
 }
 
 HTTPCoroConnector::FizzContextAndVerifier

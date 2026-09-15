@@ -69,6 +69,15 @@ class HQServer {
     server_->setTransportStatsCallbackFactory(std::move(statsFactory));
   }
 
+  // Forward a transport-settings override fn to the underlying QuicServer; it
+  // runs per-connection. Call before start(). Lets callers gate settings (e.g.
+  // behind a JustKnob) without HQServer depending on the gating system.
+  void setTransportSettingsOverrideFn(
+      quic::QuicServer::TransportSettingsOverrideFn fn) {
+    CHECK(server_);
+    server_->setTransportSettingsOverrideFn(std::move(fn));
+  }
+
   // Takeover runtime wrapper methods - forward to underlying QuicServer
   // Takeover part 1: Methods called on the old instance.
   void allowBeingTakenOver(const folly::SocketAddress& addr);
@@ -89,7 +98,8 @@ class HQServer {
   void startPacketForwarding(const folly::SocketAddress& addr);
 
   // Takeover part 4: Methods called on the old instance to wind down.
-  void rejectNewConnections(std::function<bool()> rejectFn);
+  void rejectNewConnections(
+      std::function<bool(const quic::SocketAddress&)> rejectFn);
   void pauseRead();
 
   void setFizzContext(
@@ -191,13 +201,16 @@ class HQServerTransportFactory
   }
 
  private:
+  bool onQuicWriteCipherAvailable(
+      std::shared_ptr<quic::QuicSocket> quicSocket) override;
   void onQuicTransportReady(
       std::shared_ptr<quic::QuicSocket> quicSocket) override;
   void onConnectionSetupError(std::shared_ptr<quic::QuicSocket> quicSocket,
                               quic::QuicError code) override;
   wangle::ConnectionManager* getConnectionManager(folly::EventBase* evb);
   void handleHQAlpn(std::shared_ptr<quic::QuicSocket> quicSocket,
-                    wangle::ConnectionManager* connMgr);
+                    wangle::ConnectionManager* connMgr,
+                    bool calledFromWriteCipherPath = false);
 
   // Configuration params
   const HQServerParams& params_;

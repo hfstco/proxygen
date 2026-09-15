@@ -132,7 +132,7 @@ HTTPSource* makeHTTPRequestSource(
 }
 
 folly::coro::Task<void> makeRequestReadResponse(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     HTTPSourceHolder reqSource,
     HTTPSourceReader reader,
@@ -226,7 +226,7 @@ HTTPCoroConnector::SessionParams HTTPClient::getSessionParams(
   return sessParams;
 }
 
-folly::coro::Task<HTTPCoroSession*> HTTPClient::getHTTPSession(
+folly::coro::Task<CoroSessionHandle> HTTPClient::getHTTPSession(
     folly::EventBase* evb,
     std::string host,
     uint16_t port,
@@ -283,8 +283,8 @@ folly::coro::Task<HTTPCoroSession*> HTTPClient::getHTTPSession(
       evb, serverAddr, connectTimeout, connParams, sessParams));
 }
 
-folly::coro::Task<HTTPCoroSession*> HTTPClient::getHTTPSessionViaProxy(
-    HTTPCoroSession* proxySession,
+folly::coro::Task<CoroSessionHandle> HTTPClient::getHTTPSessionViaProxy(
+    CoroSessionHandle proxySession,
     std::string host,
     uint16_t port,
     bool connectUnique,
@@ -329,7 +329,7 @@ folly::coro::Task<HTTPClient::Response> HTTPClient::get(
 }
 
 folly::coro::Task<HTTPClient::Response> HTTPClient::get(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     URL url,
     std::chrono::milliseconds timeout,
     RequestHeaderMap requestHeaders) {
@@ -343,7 +343,7 @@ folly::coro::Task<HTTPClient::Response> HTTPClient::get(
 }
 
 folly::coro::Task<HTTPClient::Response> HTTPClient::get(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     URL url,
     std::chrono::milliseconds timeout,
@@ -358,7 +358,7 @@ folly::coro::Task<HTTPClient::Response> HTTPClient::get(
   co_return resp;
 }
 
-folly::coro::Task<void> HTTPClient::get(HTTPCoroSession* session,
+folly::coro::Task<void> HTTPClient::get(CoroSessionHandle session,
                                         URL url,
                                         HTTPSourceReader reader,
                                         std::chrono::milliseconds timeout,
@@ -380,7 +380,7 @@ folly::coro::Task<void> HTTPClient::get(HTTPCoroSession* session,
 }
 
 folly::coro::Task<void> HTTPClient::get(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     URL url,
     HTTPSourceReader reader,
@@ -445,7 +445,7 @@ folly::coro::Task<HTTPClient::Response> HTTPClient::post(
 }
 
 folly::coro::Task<HTTPClient::Response> HTTPClient::post(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     URL url,
     std::string body,
     std::chrono::milliseconds timeout,
@@ -497,7 +497,7 @@ folly::coro::Task<void> HTTPClient::post(folly::EventBase* evb,
       timeout));
 }
 
-folly::coro::Task<void> HTTPClient::post(HTTPCoroSession* session,
+folly::coro::Task<void> HTTPClient::post(CoroSessionHandle session,
                                          URL url,
                                          std::string body,
                                          HTTPSourceReader reader,
@@ -529,13 +529,13 @@ folly::coro::Task<HTTPClient::Response> HTTPClient::readResponse(
 }
 
 folly::coro::Task<void> HTTPClient::request(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     HTTPSourceHolder reqSource,
     HTTPSourceReader reader,
     std::chrono::milliseconds timeout,
     Logger::SampledLoggerPtr logger) {
-  return makeRequestReadResponse(session,
+  return makeRequestReadResponse(std::move(session),
                                  std::move(reservation),
                                  std::move(reqSource),
                                  std::move(reader),
@@ -544,7 +544,7 @@ folly::coro::Task<void> HTTPClient::request(
 }
 
 folly::coro::Task<void> HTTPClient::request(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     HTTPMethod method,
     const URL& url,
@@ -554,7 +554,7 @@ folly::coro::Task<void> HTTPClient::request(
     std::chrono::milliseconds timeout,
     Logger::SampledLoggerPtr logger) {
   return makeRequestReadResponse(
-      session,
+      std::move(session),
       std::move(reservation),
       makeHTTPRequestSource(
           url, method, std::move(requestHeaders), std::move(body)),

@@ -16,6 +16,8 @@
 #include <proxygen/lib/http/session/HTTPSessionStats.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
 
+#include <functional>
+
 #include <folly/logging/xlog.h>
 #include <quic/common/address/QuicSocketAddressBridge.h>
 #include <quic/priority/HTTPPriorityQueue.h>
@@ -60,10 +62,10 @@ HTTPErrorCode sourceCompleteErr2ErrorCode(HTTPErrorCode ec) {
   }
 }
 
-#define SESS_STATS(method, ...)                                             \
-  if (sessionStats_) {                                                      \
-    folly::invoke(&HTTPSessionStats::method, sessionStats_, ##__VA_ARGS__); \
-  }                                                                         \
+#define SESS_STATS(method, ...)                                           \
+  if (sessionStats_) {                                                    \
+    std::invoke(&HTTPSessionStats::method, sessionStats_, ##__VA_ARGS__); \
+  }                                                                       \
   static_assert(true, "semicolon required")
 
 void setSecureMsg(HTTPMessage& msg,
@@ -448,6 +450,18 @@ struct HTTPCoroSession::StreamState {
 
 using quic::HTTPPriorityQueue;
 
+CoroSessionHandle::CoroSessionHandle(HTTPCoroSession* session) noexcept
+    : ctx_(session ? session->acquireKeepAlive() : HTTPSessionContextPtr{}) {
+}
+
+HTTPCoroSession* CoroSessionHandle::get() noexcept {
+  return static_cast<HTTPCoroSession*>(ctx_.get());
+}
+
+const HTTPCoroSession* CoroSessionHandle::get() const noexcept {
+  return static_cast<const HTTPCoroSession*>(ctx_.get());
+}
+
 HTTPCoroSession::HTTPCoroSession(folly::EventBase* eventBase,
                                  folly::SocketAddress localAddr,
                                  folly::SocketAddress peerAddr,
@@ -509,44 +523,45 @@ void HTTPQuicCoroSession::setEarlyDataHandler(
   earlyDataHandler_ = std::move(handler);
 }
 
-HTTPCoroSession* HTTPCoroSession::makeUpstreamCoroSession(
+CoroSessionHandle HTTPCoroSession::makeUpstreamCoroSession(
     std::unique_ptr<folly::coro::TransportIf> coroTransport,
     std::unique_ptr<HTTPCodec> codec,
     wangle::TransportInfo tinfo) {
   XCHECK(proxygen::isUpstream(codec->getTransportDirection()));
-  return new HTTPUniplexTransportSession(
-      std::move(coroTransport), std::move(codec), std::move(tinfo));
+  return CoroSessionHandle(new HTTPUniplexTransportSession(
+      std::move(coroTransport), std::move(codec), std::move(tinfo)));
 }
 
-HTTPCoroSession* HTTPCoroSession::makeDownstreamCoroSession(
+CoroSessionHandle HTTPCoroSession::makeDownstreamCoroSession(
     std::unique_ptr<folly::coro::TransportIf> coroTransport,
     std::shared_ptr<HTTPHandler> handler,
     std::unique_ptr<HTTPCodec> codec,
     wangle::TransportInfo tinfo) {
   XCHECK(proxygen::isDownstream(codec->getTransportDirection()));
-  return new HTTPUniplexTransportSession(std::move(coroTransport),
-                                         std::move(codec),
-                                         std::move(tinfo),
-                                         std::move(handler));
+  return CoroSessionHandle(
+      new HTTPUniplexTransportSession(std::move(coroTransport),
+                                      std::move(codec),
+                                      std::move(tinfo),
+                                      std::move(handler)));
 }
 
-HTTPCoroSession* HTTPCoroSession::makeUpstreamCoroSession(
+CoroSessionHandle HTTPCoroSession::makeUpstreamCoroSession(
     std::shared_ptr<quic::QuicSocket> sock,
     std::unique_ptr<hq::HQMultiCodec> codec,
     wangle::TransportInfo tinfo) {
   XCHECK(proxygen::isUpstream(codec->getTransportDirection()));
-  return new HTTPQuicCoroSession(
-      std::move(sock), std::move(codec), std::move(tinfo));
+  return CoroSessionHandle(new HTTPQuicCoroSession(
+      std::move(sock), std::move(codec), std::move(tinfo)));
 }
 
-HTTPCoroSession* HTTPCoroSession::makeDownstreamCoroSession(
+CoroSessionHandle HTTPCoroSession::makeDownstreamCoroSession(
     std::shared_ptr<quic::QuicSocket> sock,
     std::shared_ptr<HTTPHandler> handler,
     std::unique_ptr<hq::HQMultiCodec> codec,
     wangle::TransportInfo tinfo) {
   XCHECK(proxygen::isDownstream(codec->getTransportDirection()));
-  return new HTTPQuicCoroSession(
-      std::move(sock), std::move(codec), std::move(tinfo), std::move(handler));
+  return CoroSessionHandle(new HTTPQuicCoroSession(
+      std::move(sock), std::move(codec), std::move(tinfo), std::move(handler)));
 }
 
 void HTTPUniplexTransportSession::start() {
@@ -572,7 +587,8 @@ void HTTPUniplexTransportSession::start() {
     codec_.addFilters(std::move(rateLimitFilter));
   }
   codec_.setCallback(this);
-  ::proxygen::detail::setEgressWtHttpSettings(codec_->getEgressSettings());
+  ::proxygen::detail::setEgressWtHttpSettings(direction_,
+                                              codec_->getEgressSettings());
   sendPreface();
 }
 
@@ -3849,7 +3865,7 @@ folly::coro::Task<WtReqResult> HTTPCoroSession::sendWtReq(
       isHQCodecProtocol(getCodecProtocol())
           ? ::proxygen::detail::supportsH3Wt(
                 codec_->getTransportDirection(), ingress, egress)
-          : ::proxygen::detail::supportsH2Wt({ingress, egress});
+          : ::proxygen::detail::supportsH2Wt(direction_, ingress, egress);
   const bool validWtReq = HTTPWebTransport::isConnectMessage(msg);
   if (!(wtEnabled && validWtReq)) {
     auto err = !validWtReq ? kInvalidWtReq : kWtNotSupported;

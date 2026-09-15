@@ -1354,6 +1354,173 @@ TEST_F(HTTPDownstreamSessionTest, TestOnContentMismatch) {
   gracefulShutdown();
 }
 
+// A request carrying both Transfer-Encoding and Content-Length is counted.
+// Client codecs normalize away one of the two framing headers, so the raw
+// request is fed directly to exercise the ambiguous case.
+TEST_F(HTTPDownstreamSessionTest, RequestWithTEAndCLRecorded) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressReqWithTEAndCL()).Times(1);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  const std::string rawRequest =
+      "POST / HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "Content-Length: 0\r\n"
+      "\r\n"
+      "0\r\n\r\n";
+  requests_.append(folly::IOBuf::copyBuffer(rawRequest));
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// A request with only Content-Length is a normal request and is not counted.
+TEST_F(HTTPDownstreamSessionTest, RequestWithOnlyContentLengthNotRecorded) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressReqWithTEAndCL()).Times(0);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  const std::string rawRequest =
+      "POST / HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 5\r\n"
+      "\r\n"
+      "hello";
+  requests_.append(folly::IOBuf::copyBuffer(rawRequest));
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// A request with only Transfer-Encoding is a normal request and is not counted.
+TEST_F(HTTPDownstreamSessionTest, RequestWithOnlyTransferEncodingNotRecorded) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressReqWithTEAndCL()).Times(0);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  const std::string rawRequest =
+      "POST / HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n"
+      "0\r\n\r\n";
+  requests_.append(folly::IOBuf::copyBuffer(rawRequest));
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// A GET request without a body must not be counted.
+TEST_F(HTTPDownstreamSessionTest, GetRequestWithoutBodyNotRecorded) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressGetRequestWithBody()).Times(0);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  sendRequest();
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// A GET request that carries body bytes must be counted exactly once.
+TEST_F(HTTPDownstreamSessionTest, GetRequestWithBodyRecordedOnce) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressGetRequestWithBody()).Times(1);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  auto req = getGetRequest();
+  req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, "10");
+  auto streamID = sendRequest(req, /*eom=*/false);
+  clientCodec_->generateBody(
+      requests_, streamID, makeBuf(10), HTTPCodec::NoPadding, /*eom=*/true);
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// Body split across multiple frames is still counted only once per request.
+TEST_F(HTTPDownstreamSessionTest,
+       GetRequestWithBodyMultipleFramesRecordedOnce) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressGetRequestWithBody()).Times(1);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  auto req = getGetRequest();
+  req.getHeaders().set(HTTP_HEADER_CONTENT_LENGTH, "20");
+  auto streamID = sendRequest(req, /*eom=*/false);
+  clientCodec_->generateBody(
+      requests_, streamID, makeBuf(10), HTTPCodec::NoPadding, /*eom=*/false);
+  clientCodec_->generateBody(
+      requests_, streamID, makeBuf(10), HTTPCodec::NoPadding, /*eom=*/true);
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// A POST request with a body is a normal request and must not be counted.
+TEST_F(HTTPDownstreamSessionTest, PostRequestWithBodyNotRecorded) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressGetRequestWithBody()).Times(0);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  auto req = getPostRequest(10);
+  auto streamID = sendRequest(req, /*eom=*/false);
+  clientCodec_->generateBody(
+      requests_, streamID, makeBuf(10), HTTPCodec::NoPadding, /*eom=*/true);
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
+// The measurement is not scoped to a protocol, so a GET request with body
+// bytes over HTTP/2 is also counted.
+TEST_F(HTTP2DownstreamSessionTest, GetRequestWithBodyRecordedForHTTP2) {
+  NiceMock<MockHTTPSessionStats> stats;
+  httpSession_->setSessionStats(&stats);
+  EXPECT_CALL(stats, _recordIngressGetRequestWithBody()).Times(1);
+
+  InSequence enforceOrder;
+  auto handler = addSimpleNiceHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler]() { handler->sendReplyWithBody(200, 100); });
+
+  auto req = getGetRequest();
+  auto streamID = sendRequest(req, /*eom=*/false);
+  clientCodec_->generateBody(
+      requests_, streamID, makeBuf(10), HTTPCodec::NoPadding, /*eom=*/true);
+  flushRequestsAndLoop();
+  gracefulShutdown();
+}
+
 TEST_F(HTTPDownstreamSessionTest, HttpWithAckTimingPipeline) {
   // Test a real pipelining case as well.  First request is done waiting for
   // ack, then receive two pipelined requests.
@@ -1619,6 +1786,42 @@ TEST_F(HTTP2DownstreamSessionTest, TestPingWithPreSendSplit) {
   parseOutput(*clientCodec_);
 }
 
+TEST_F(HTTP2DownstreamSessionTest,
+       SlowConsumerPreSendSplitCountsOnlyWrittenBody) {
+  httpSession_->setSlowConsumerParams(
+      /*queueThresholdBytes=*/10,
+      /*minDequeueBytes=*/10,
+      /*window=*/milliseconds(1));
+
+  auto byteEventTracker = new NiceMock<MockByteEventTracker>(nullptr);
+  EXPECT_CALL(*byteEventTracker, drainByteEvents()).WillRepeatedly(Return(0));
+  EXPECT_CALL(*byteEventTracker, processByteEvents(_, _))
+      .WillRepeatedly(Invoke([](std::shared_ptr<ByteEventTracker> self,
+                                uint64_t bytesWritten) {
+        return self->ByteEventTracker::processByteEvents(self, bytesWritten);
+      }));
+  EXPECT_CALL(*byteEventTracker, preSend(_, _, _, _))
+      .WillOnce(Return(1))
+      .WillOnce(Invoke([this](bool*, bool*, bool*, uint64_t) {
+        transport_->pauseWrites();
+        return 0;
+      }))
+      .WillRepeatedly(Return(0));
+
+  auto handler = addSimpleStrictHandler();
+  sendRequest();
+  handler->expectHeaders();
+  handler->expectEOM([this, &handler, byteEventTracker] {
+    httpSession_->setByteEventTracker(
+        std::unique_ptr<ByteEventTracker>(byteEventTracker));
+    handler->sendReplyWithBody(200, 100);
+  });
+  handler->expectDetachTransaction();
+  expectDetachSession();
+
+  flushRequestsAndLoop();
+}
+
 TEST_F(HTTP2DownstreamSessionTest, SetByteEventTracker) {
   // Send two requests with writes paused, which will queue several byte events,
   // including last byte events which are holding a reference to the
@@ -1689,6 +1892,44 @@ TEST_F(HTTP2DownstreamSessionTest, SendNoErrorAfterEomFlush) {
                  /*expect100=*/false,
                  /*expectGoaway=*/false,
                  /*expectBody=*/false);
+  gracefulShutdown();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, SlowConsumerDropsSession) {
+  // A peer that never drains bytes should trip the slow-consumer detector.
+  httpSession_->setSlowConsumerParams(
+      /*queueThresholdBytes=*/1024,
+      /*minDequeueBytes=*/1024,
+      /*window=*/milliseconds(50));
+
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler, this] {
+    transport_->pauseWrites();
+    handler->sendReplyWithBody(200, 8192);
+  });
+  handler->expectDetachTransaction();
+  expectDetachSession();
+
+  sendRequest();
+  flushRequestsAndLoop();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, SlowConsumerKeepsSessionWhenDraining) {
+  // If writes complete promptly, the detector should not trip even under a
+  // response large enough to exceed queueThreshold_ briefly.
+  httpSession_->setSlowConsumerParams(
+      /*queueThresholdBytes=*/1024,
+      /*minDequeueBytes=*/1024,
+      /*window=*/milliseconds(50));
+
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler] { handler->sendReplyWithBody(200, 8192); });
+  handler->expectDetachTransaction();
+
+  sendRequest();
+  flushRequestsAndLoopN(2);
   gracefulShutdown();
 }
 

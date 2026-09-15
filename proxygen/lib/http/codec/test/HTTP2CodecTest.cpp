@@ -14,6 +14,7 @@
 #include <proxygen/lib/http/codec/test/HTTP2FramerTest.h>
 #include <proxygen/lib/http/codec/test/HTTPParallelCodecTest.h>
 #include <proxygen/lib/http/codec/test/MockHTTPCodec.h>
+#include <proxygen/lib/http/webtransport/WtUtils.h>
 
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
@@ -1515,6 +1516,93 @@ TEST_F(HTTP2CodecTest, BasicSetting) {
   EXPECT_EQ(callbacks_.sessionErrors, 0);
 }
 
+TEST_F(HTTP2CodecTest, WebTransportSettings) {
+  constexpr auto kWtSettings =
+      std::array{SettingsId::WT_ENABLED,
+                 SettingsId::WT_INITIAL_MAX_DATA,
+                 SettingsId::WT_INITIAL_MAX_STREAM_DATA_UNI,
+                 SettingsId::WT_INITIAL_MAX_STREAM_DATA_BIDI,
+                 SettingsId::WT_INITIAL_MAX_STREAMS_UNI,
+                 SettingsId::WT_INITIAL_MAX_STREAMS_BIDI};
+
+  auto* settings = upstreamCodec_.getEgressSettings();
+  settings->clearSettings();
+  for (auto id : kWtSettings) {
+    settings->setSetting(id, 1);
+  }
+
+  // expect ::onSettings to contain all of kWtSettings
+  upstreamCodec_.generateSettings(output_);
+  parse();
+  const auto& ingressSettings = callbacks_.ingressSettings;
+  EXPECT_EQ(ingressSettings.size(), kWtSettings.size());
+  for (size_t i = 0; i < ingressSettings.size(); i++) {
+    EXPECT_EQ(ingressSettings[i].id, kWtSettings[i]);
+    EXPECT_EQ(ingressSettings[i].value, 1);
+  }
+}
+
+/*
+ * supportsH2Wt returns iff server advertises support for http/2 wt
+ * (WT_ENABLED & ENABLE_CONNECT_PROTOCOL); client does not need to advertise
+ * any settings to indicate support for wt
+ */
+TEST(HTTP2CodecWebTransportTest, SupportsH2WebTransport) {
+  HTTPSettings client;
+  HTTPSettings server;
+  server.setSetting(SettingsId::ENABLE_CONNECT_PROTOCOL, 1);
+  server.setSetting(SettingsId::WT_ENABLED, 1);
+
+  EXPECT_TRUE(proxygen::detail::supportsH2Wt(
+      TransportDirection::UPSTREAM, /*ingress=*/&server, /*egress=*/&client));
+  EXPECT_TRUE(proxygen::detail::supportsH2Wt(
+      TransportDirection::DOWNSTREAM, /*ingress=*/&client, /*egress=*/&server));
+
+  // unset WT_ENABLE => server does not support wt
+  server.unsetSetting(SettingsId::WT_ENABLED);
+  EXPECT_FALSE(proxygen::detail::supportsH2Wt(
+      TransportDirection::UPSTREAM, &server, &client));
+}
+
+TEST(HTTP2CodecWebTransportTest, SetsEgressH2WebTransportSettings) {
+  static constexpr auto kDefaultWtSettings = {
+      SettingsId::WT_INITIAL_MAX_DATA,
+      SettingsId::WT_INITIAL_MAX_STREAM_DATA_UNI,
+      SettingsId::WT_INITIAL_MAX_STREAM_DATA_BIDI,
+      SettingsId::WT_INITIAL_MAX_STREAMS_UNI,
+      SettingsId::WT_INITIAL_MAX_STREAMS_BIDI};
+
+  {
+    // always advertise the above wt settings for http/2 clients
+    HTTPSettings client;
+    proxygen::detail::setEgressWtHttpSettings(TransportDirection::UPSTREAM,
+                                              &client);
+    for (auto id : kDefaultWtSettings) {
+      EXPECT_NE(client.getSetting(id), nullptr);
+    }
+  }
+
+  {
+    // only advertise the above wt settings for http/2 servers if WT_ENABLED &&
+    // ENABLE_CONNECT_PROTOCOL are set
+    HTTPSettings server;
+    proxygen::detail::setEgressWtHttpSettings(TransportDirection::DOWNSTREAM,
+                                              &server);
+    for (auto id : kDefaultWtSettings) {
+      EXPECT_EQ(server.getSetting(id), nullptr);
+    }
+
+    server.setSetting(SettingsId::ENABLE_CONNECT_PROTOCOL, 1);
+    server.setSetting(SettingsId::WT_ENABLED, 1);
+    proxygen::detail::setEgressWtHttpSettings(TransportDirection::DOWNSTREAM,
+                                              &server);
+
+    for (auto id : kDefaultWtSettings) {
+      EXPECT_NE(server.getSetting(id), nullptr);
+    }
+  }
+}
+
 TEST_F(HTTP2CodecTest, SettingsAck) {
   upstreamCodec_.generateSettingsAck(output_);
 
@@ -2597,11 +2685,11 @@ TEST_F(HTTP2CodecTest, GenerateHeadersWithEmptyRequest) {
 
 TEST_F(HTTP2CodecTest, SetIfNotPresent) {
   auto* egressSettings = CHECK_NOTNULL(downstreamCodec_.getEgressSettings());
-  // WT_MAX_SESSIONS not currently present
-  EXPECT_TRUE(egressSettings->setIfNotPresent(SettingsId::WT_MAX_SESSIONS, 1));
+  // WT_ENABLED not currently present
+  EXPECT_TRUE(egressSettings->setIfNotPresent(SettingsId::WT_ENABLED, 1));
   // no-op since added above
-  EXPECT_FALSE(egressSettings->setIfNotPresent(SettingsId::WT_MAX_SESSIONS, 2));
+  EXPECT_FALSE(egressSettings->setIfNotPresent(SettingsId::WT_ENABLED, 2));
   // expected value is 1
-  auto* wtMaxSessions = egressSettings->getSetting(SettingsId::WT_MAX_SESSIONS);
-  EXPECT_TRUE(wtMaxSessions && wtMaxSessions->value == 1);
+  auto* wtEnabled = egressSettings->getSetting(SettingsId::WT_ENABLED);
+  EXPECT_TRUE(wtEnabled && wtEnabled->value == 1);
 }

@@ -14,14 +14,21 @@
 #include "proxygen/lib/http/coro/client/test/HTTPClientTestsCommon.h"
 #include "proxygen/lib/http/coro/test/HTTPTestSources.h"
 #include "proxygen/lib/http/coro/util/test/TestHelpers.h"
+#include <fizz/protocol/test/CertUtil.h>
 #include <folly/logging/xlog.h>
 #include <quic/client/QuicClientTransport.h>
 
+#include <folly/FileUtil.h>
 #include <folly/SocketAddress.h>
 #include <folly/coro/AsyncScope.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/Timeout.h>
 #include <folly/coro/ViaIfAsync.h>
+#include <folly/portability/OpenSSL.h>
+#include <folly/ssl/OpenSSLCertUtils.h>
+#include <folly/ssl/OpenSSLKeyUtils.h>
+#include <folly/ssl/OpenSSLPtrTypes.h>
+#include <folly/testing/TestUtil.h>
 #include <quic/api/test/Mocks.h>
 #include <quic/state/test/Mocks.h>
 #include <variant>
@@ -74,19 +81,22 @@ folly::coro::Task<HTTPCoroSession*> HTTPCoroConnector_connect(
     HTTPCoroConnector::SessionParams sessParams =
         HTTPClient::getSessionParams()) {
   if (connParams.index() == 1) {
-    return HTTPCoroConnector::connect(
-        evb,
-        addr,
-        timeout,
-        std::get<HTTPCoroConnector::QuicConnectionParams>(connParams),
-        sessParams);
+    co_return (
+        co_await HTTPCoroConnector::connect(
+            evb,
+            addr,
+            timeout,
+            std::get<HTTPCoroConnector::QuicConnectionParams>(connParams),
+            sessParams))
+        .get();
   } else {
-    return HTTPCoroConnector::connect(
-        evb,
-        addr,
-        timeout,
-        std::get<HTTPCoroConnector::ConnectionParams>(connParams),
-        sessParams);
+    co_return (co_await HTTPCoroConnector::connect(
+                   evb,
+                   addr,
+                   timeout,
+                   std::get<HTTPCoroConnector::ConnectionParams>(connParams),
+                   sessParams))
+        .get();
   }
 }
 
@@ -172,6 +182,68 @@ CO_TEST_P_X(HTTPClientTests, ConnectorConnect) {
     EXPECT_EQ(*tinfo.appProtocol, transportTypeToAlpn(GetParam()));
   }
   (*sess)->dropConnection();
+}
+
+CO_TEST_P_X(HTTPClientTests, IdentityVerificationE2E) {
+  // Hostname verification is wired through the Fizz cert verifier.
+  if (GetParam() != TransportType::TLS_FIZZ) {
+    co_return;
+  }
+
+  // Generate a CA and a leaf cert (SAN "test.localhost") signed by that CA.
+  auto ca = fizz::test::createCert(
+      "Test Root CA", /*ca=*/true, /*issuer=*/nullptr, fizz::KeyType::P256);
+  auto leaf = fizz::test::createCert(
+      "test.localhost", /*ca=*/false, &ca, fizz::KeyType::P256);
+
+  folly::test::TemporaryDirectory tmpDir;
+  auto caPath = (tmpDir.path() / "ca.pem").string();
+  auto leafCertPath = (tmpDir.path() / "leaf.pem").string();
+  auto leafKeyPath = (tmpDir.path() / "leaf_key.pem").string();
+  XCHECK(folly::writeFile(folly::ssl::OpenSSLCertUtils::pemEncode(*ca.cert),
+                          caPath.c_str()));
+  XCHECK(folly::writeFile(folly::ssl::OpenSSLCertUtils::pemEncode(*leaf.cert),
+                          leafCertPath.c_str()));
+  XCHECK(folly::writeFile(
+      folly::ssl::OpenSSLKeyUtils::encodePrivateKeyAsPEM(leaf.key.get()),
+      leafKeyPath.c_str()));
+
+  // Stand up a server that presents the leaf cert.
+  auto tlsConfig = HTTPServer::getDefaultTLSConfig();
+  tlsConfig.isDefault = true;
+  tlsConfig.clientVerification =
+      folly::SSLContext::VerifyClientCertificate::DO_NOT_REQUEST;
+  tlsConfig.setNextProtocols({"h2", "http/1.1"});
+  tlsConfig.setCertificate(leafCertPath, leafKeyPath, "");
+  HTTPServer::Config serverConfig;
+  serverConfig.socketConfig.bindAddress.setFromIpPort("127.0.0.1", 0);
+  serverConfig.socketConfig.sslContextConfigs.emplace_back(
+      std::move(tlsConfig));
+  auto server = ScopedHTTPServer::start(std::move(serverConfig), testHandler_);
+  auto serverAddr = *server->address();
+
+  auto connectWithSni = [&](const std::string& sni) {
+    HTTPCoroConnector::TLSParams tlsParams;
+    tlsParams.caPaths = {caPath};
+    tlsParams.nextProtocols = {"h2", "http/1.1"};
+    HTTPCoroConnector::ConnectionParams connParams;
+    connParams.serverName = sni;
+    connParams.insecureSkipIdentityValidation = false;
+    connParams.fizzContextAndVerifier =
+        HTTPCoroConnector::makeFizzClientContextAndVerifier(tlsParams);
+    return HTTPCoroConnector_connect(
+        &evb_, serverAddr, seconds(1), std::move(connParams));
+  };
+
+  // Matching hostname => cert validates => connection succeeds.
+  auto matched = co_await co_awaitTry(connectWithSni("test.localhost"));
+  XCHECK(!matched.hasException()) << matched.exception();
+  (*matched)->dropConnection();
+
+  // Wrong hostname => verifier rejects the cert => connection is rejected.
+  auto rejected = co_await co_awaitTry(connectWithSni("wrong.example.com"));
+  EXPECT_TRUE(rejected.hasException())
+      << "wrong hostname should reject the connection";
 }
 
 CO_TEST_P_X(HTTPClientTests, ConnectWithCustomTimeout) {
@@ -1273,7 +1345,7 @@ CO_TEST_P_X(HTTPCoroSessionPoolTests, TwoWaitersOneConns) {
   EXPECT_EQ(resp->headers->getStatusCode(), 200);
   EXPECT_TRUE(resp->eom);
   auto res2 = co_await folly::coro::co_awaitTry(std::move(res2Fut));
-  EXPECT_EQ(res1->session, res2->session);
+  EXPECT_EQ(res1->session.get(), res2->session.get());
   auto get2Fut = co_withExecutor(&evb_,
                                  res2->session->sendRequest(
                                      HTTPFixedSource::makeFixedRequest("/"),
@@ -1281,7 +1353,7 @@ CO_TEST_P_X(HTTPCoroSessionPoolTests, TwoWaitersOneConns) {
                      .start();
   auto res3 = co_await folly::coro::co_awaitTry(std::move(res3Fut));
   XCHECK(res3.hasValue());
-  EXPECT_EQ(res1->session, res3->session);
+  EXPECT_EQ(res1->session.get(), res3->session.get());
 
   // maxWaiters=2 => res4Fut is cancelled
   EXPECT_TRUE(res4Fut.isReady() && res4Fut.hasException() &&
@@ -1327,7 +1399,7 @@ CO_TEST_P_X(HTTPCoroSessionPoolTests, TwoWaitersTwoConns) {
   EXPECT_EQ(resp->headers->getStatusCode(), 200);
   EXPECT_TRUE(resp->eom);
   auto res3 = co_await folly::coro::co_awaitTry(std::move(res3Fut));
-  EXPECT_EQ(res1->session, res3->session);
+  EXPECT_EQ(res1->session.get(), res3->session.get());
   auto get3Fut = co_withExecutor(&evb_,
                                  res3->session->sendRequest(
                                      HTTPFixedSource::makeFixedRequest("/"),
@@ -1340,7 +1412,7 @@ CO_TEST_P_X(HTTPCoroSessionPoolTests, TwoWaitersTwoConns) {
   EXPECT_EQ(resp->headers->getStatusCode(), 200);
   EXPECT_TRUE(resp->eom);
   auto res4 = co_await folly::coro::co_awaitTry(std::move(res4Fut));
-  EXPECT_EQ(res2->session, res4->session);
+  EXPECT_EQ(res2->session.get(), res4->session.get());
   // meh abandon get3Fut
   pool_->drain();
 }
@@ -1369,7 +1441,7 @@ CO_TEST_P_X(HTTPCoroSessionPoolTests, PoolConnect) {
   EXPECT_FALSE(res2.hasException());
   auto localPort2 = res2->session->getLocalAddress().getPort();
   // The connected session is H1, so full, expect a new top level session
-  EXPECT_NE(res1->session, res2->session);
+  EXPECT_NE(res1->session.get(), res2->session.get());
 
   if (GetParam() == TransportType::TCP) {
     // The underlying session is H1, so a new underlying session is created
@@ -1609,7 +1681,7 @@ CO_TEST_P_X(HTTPCoroSessionPoolTests, IdleSessionsTest) {
       auto res = co_await pool_->getSessionWithReservation();
       // destructing reservation will move to idle
       EXPECT_CALL(idleSessionObs, onIdleSessionsChanged(_)).Times(1);
-      session = res.session;
+      session = res.session.get();
     }
 
     EXPECT_CALL(idleSessionObs, onIdleSessionsChanged(_)).Times(1);

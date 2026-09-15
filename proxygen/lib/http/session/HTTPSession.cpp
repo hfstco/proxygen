@@ -151,7 +151,7 @@ void HTTPSession::setupCodec() {
     connFlowControl_ = new FlowControlFilter(*this, writeBuf_, codec_.call());
     codec_.addFilters(std::unique_ptr<FlowControlFilter>(connFlowControl_));
   }
-  if (codec_->supportsParallelRequests() && sock_ && isDownstream()) {
+  if (codec_->supportsParallelRequests() && isDownstream()) {
     auto rateLimitFilter = std::make_unique<RateLimitFilter>(
         &getEventBase()->timer(), sessionStats_);
     rateLimitFilter->addRateLimiter(RateLimiter::Type::HEADERS);
@@ -204,7 +204,8 @@ std::chrono::milliseconds HTTPSession::getDrainTimeout() const {
 void HTTPSession::startNow() {
   CHECK(!started_);
   started_ = true;
-  detail::setEgressWtHttpSettings(codec_->getEgressSettings());
+  detail::setEgressWtHttpSettings(codec_->getTransportDirection(),
+                                  codec_->getEgressSettings());
 
   codec_->generateSettings(writeBuf_);
   if (connFlowControl_) {
@@ -390,7 +391,7 @@ void HTTPSession::immediateShutdown() {
 
 void HTTPSession::dropConnection(const std::string& errorMsg) {
   VLOG(4) << "dropping " << *this;
-  if (!sock_ || (readsShutdown() && writesShutdown())) {
+  if (readsShutdown() && writesShutdown()) {
     VLOG(4) << *this << " already shutdown";
     DCHECK(!shutdownTransportCb_) << "Why is there a shutdownTransportCb_?";
     if (isLoopCallbackScheduled()) {
@@ -655,48 +656,11 @@ void HTTPSession::onMessageBegin(HTTPCodec::StreamID streamID,
 }
 
 void HTTPSession::onPushMessageBegin(HTTPCodec::StreamID streamID,
-                                     HTTPCodec::StreamID assocStreamID,
-                                     HTTPMessage* msg) {
-  VLOG(4) << "processing new push promise streamID=" << streamID
-          << " on assocStreamID=" << assocStreamID << " " << *this;
-  if (infoCallback_) {
-    infoCallback_->onRequestBegin(*this);
-  }
-  if (assocStreamID == 0) {
-    VLOG(2) << "push promise " << streamID << " should be associated with "
-            << "an active stream=" << assocStreamID << " " << *this;
-    invalidStream(streamID, ErrorCode::PROTOCOL_ERROR);
-    return;
-  }
-
-  if (isDownstream()) {
-    VLOG(2) << "push promise cannot be sent to upstream " << *this;
-    invalidStream(streamID, ErrorCode::PROTOCOL_ERROR);
-    return;
-  }
-
-  HTTPTransaction* assocTxn = findTransaction(assocStreamID);
-  if (!assocTxn || assocTxn->isIngressEOMSeen()) {
-    VLOG(2) << "cannot find the assocTxn=" << assocTxn
-            << ", or assoc stream is already closed by upstream" << *this;
-    invalidStream(streamID, ErrorCode::PROTOCOL_ERROR);
-    return;
-  }
-
-  auto txn = createTransaction(streamID, assocStreamID);
-  if (!txn) {
-    return; // This could happen if the socket is bad.
-  }
-
-  if (!assocTxn->onPushedTransaction(txn)) {
-    VLOG(1) << "Failed to add pushed txn " << streamID << " to assoc txn "
-            << assocStreamID << " on " << *this;
-    HTTPException ex(
-        HTTPException::Direction::INGRESS_AND_EGRESS,
-        folly::to<std::string>("Failed to add pushed transaction ", streamID));
-    ex.setCodecStatusCode(ErrorCode::REFUSED_STREAM);
-    onError(streamID, ex, true);
-  }
+                                     HTTPCodec::StreamID,
+                                     HTTPMessage*) {
+  // http/2 push in proxygen/lib is not supported
+  codec_->generateRstStream(writeBuf_, streamID, ErrorCode::REFUSED_STREAM);
+  scheduleWrite();
 }
 
 void HTTPSession::onHeadersComplete(HTTPCodec::StreamID streamID,
@@ -1331,6 +1295,12 @@ size_t HTTPSession::sendBody(HTTPTransaction* txn,
   return encodedSize;
 }
 
+uint64_t HTTPSession::takeBodyBytesForWrite(uint64_t writeLen) {
+  auto bodyBytes = std::min(bodyBytesPerWriteBuf_, writeLen);
+  bodyBytesPerWriteBuf_ -= bodyBytes;
+  return bodyBytes;
+}
+
 size_t HTTPSession::sendChunkHeader(HTTPTransaction* txn,
                                     size_t length) noexcept {
   size_t encodedSize =
@@ -1870,7 +1840,6 @@ void HTTPSession::runSessionLoopCallback() noexcept {
 
   uint64_t bytesWritten = 0;
   for (uint32_t i = 0; i < kMaxWritesPerLoop; ++i) {
-    bodyBytesPerWriteBuf_ = 0;
     bool cork = true;
     bool timestampTx = false;
     bool timestampAck = false;
@@ -1896,6 +1865,7 @@ void HTTPSession::runSessionLoopCallback() noexcept {
     flags |= (timestampAck) ? folly::WriteFlags::EOR : folly::WriteFlags::NONE;
     CHECK(!pendingWrite_.hasValue());
     pendingWrite_.emplace(len, DestructorGuard(this));
+    bodyBytesPendingWrite_ = takeBodyBytesForWrite(len);
 
     if (!writeTimeout_.isScheduled()) {
       // Any performance concern here?
@@ -2411,6 +2381,8 @@ void HTTPSession::writeSuccess() noexcept {
   auto bytesWritten = pendingWrite_->first;
   bytesWritten_ += bytesWritten;
   transportInfo_.totalBytes += bytesWritten;
+  HTTPSessionBase::onBodyBytesWritten(bodyBytesPendingWrite_);
+  bodyBytesPendingWrite_ = 0;
   CHECK(writeTimeout_.isScheduled());
   VLOG(10) << "Cancel write timer on last successful write";
   writeTimeout_.cancelTimeout();
@@ -2468,6 +2440,7 @@ void HTTPSession::writeErr(size_t bytesWritten,
   DestructorGuard dg(this);
   DCHECK(pendingWrite_.hasValue());
   pendingWrite_.reset();
+  bodyBytesPendingWrite_ = 0;
   if (infoCallback_) {
     infoCallback_->onWrite(*this, bytesWritten);
   }
@@ -2717,7 +2690,7 @@ void HTTPSession::onTxnByteEventWrittenToBuf(const ByteEvent& event) noexcept {
 }
 
 bool HTTPSession::isDetachable(bool checkSocket) const {
-  if (checkSocket && sock_ && !sock_->isDetachable()) {
+  if (checkSocket && !sock_->isDetachable()) {
     return false;
   }
   return transactions_.size() == 0 && getNumIncomingStreams() == 0 &&
@@ -2743,8 +2716,9 @@ void HTTPSession::invokeOnAllTransactions(
 
 bool HTTPSession::supportsWebTransport() const noexcept {
   const auto& codec = getCodec();
-  return detail::supportsH2Wt(
-      {codec.getIngressSettings(), codec.getEgressSettings()});
+  return detail::supportsH2Wt(codec.getTransportDirection(),
+                              codec.getIngressSettings(),
+                              codec.getEgressSettings());
 }
 
 bool HTTPSession::tryWtSession(HTTPTransaction& txn,

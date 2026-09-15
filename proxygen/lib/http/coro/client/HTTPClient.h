@@ -64,7 +64,7 @@ class HTTPClient {
   // Same as above, but takes an existing session.  timeout=0 defaults to the
   // session timeout
   static folly::coro::Task<Response> get(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       URL url,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
       RequestHeaderMap requestHeaders = RequestHeaderMap());
@@ -72,7 +72,7 @@ class HTTPClient {
   // Same as above, but takes an existing session and reservation.
   // timeout=0 defaults to the session timeout
   static folly::coro::Task<Response> get(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       URL url,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
@@ -90,7 +90,7 @@ class HTTPClient {
   // Same as above, but takes an existing session.  timeout=0 defaults to the
   // session timeout
   static folly::coro::Task<void> get(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       URL url,
       HTTPSourceReader reader,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
@@ -99,7 +99,7 @@ class HTTPClient {
   // Same as above, but takes an existing session and reservation.
   // timeout=0 defaults to the session timeout
   static folly::coro::Task<void> get(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       URL url,
       HTTPSourceReader reader,
@@ -118,7 +118,7 @@ class HTTPClient {
   // Same as above, but takes an existing session.  timeout=0 defaults to the
   // session timeout
   static folly::coro::Task<Response> post(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       URL url,
       std::string body,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(0),
@@ -137,7 +137,7 @@ class HTTPClient {
   // Same as above, but takes an existing session.  timeout=0 defaults to the
   // session timeout
   static folly::coro::Task<void> post(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       URL url,
       std::string body,
       HTTPSourceReader reader,
@@ -145,7 +145,7 @@ class HTTPClient {
       RequestHeaderMap requestHeaders = RequestHeaderMap());
 
   static folly::coro::Task<void> request(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       HTTPSourceHolder reqSource,
       HTTPSourceReader reader,
@@ -153,7 +153,7 @@ class HTTPClient {
       Logger::SampledLoggerPtr logger = nullptr);
 
   static folly::coro::Task<void> request(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       HTTPMethod method,
       const URL& url,
@@ -232,7 +232,7 @@ class HTTPClient {
    * `readTimeout` is used for both the connection and stream read timeout
    * (`connReadTimeout` and `streamReadTimeout`).
    */
-  static folly::coro::Task<HTTPCoroSession*> getHTTPSession(
+  static folly::coro::Task<CoroSessionHandle> getHTTPSession(
       folly::EventBase* evb,
       std::string host,
       uint16_t port,
@@ -256,8 +256,8 @@ class HTTPClient {
    * `readTimeout` is used for both the connection and stream read timeout
    * (`connReadTimeout` and `streamReadTimeout`).
    */
-  static folly::coro::Task<HTTPCoroSession*> getHTTPSessionViaProxy(
-      HTTPCoroSession* proxySession,
+  static folly::coro::Task<CoroSessionHandle> getHTTPSessionViaProxy(
+      CoroSessionHandle proxySession,
       std::string host,
       uint16_t port,
       bool connectUnique,

@@ -24,6 +24,7 @@
 #include <string>
 
 #include "proxygen/lib/http/coro/HTTPCoroSession.h"
+#include "proxygen/lib/http/coro/client/ProxygenCertVerifier.h"
 #include <proxygen/lib/http/codec/HTTPSettings.h>
 #include <proxygen/lib/http/codec/compress/HeaderCodec.h>
 #include <proxygen/lib/sampling/Sampling.h>
@@ -88,10 +89,21 @@ class HTTPCoroConnector {
   }
 
   // Helpers to make a Fizz or SSL context
+  // Builds cert verifier using makeFizzCertVerifier function below.
   static FizzContextAndVerifier makeFizzClientContextAndVerifier(
       const TLSParams& params);
   static std::shared_ptr<const fizz::client::FizzClientContext>
   makeFizzClientContext(const TLSParams& params);
+  /**
+   * Constructs a Fizz certificate verifier.
+   *
+   * If `params.caPaths` is not explicitly set, then the following environment
+   * variables are tried, in order:
+   *    1. PROXYGEN_CORO_CA_PATH
+   *    2. CURL_CA_BUNDLE
+   *    3. hardcoded default
+   * If no ca path candidate exists, then this function will throw.
+   */
   static std::shared_ptr<const fizz::CertificateVerifier> makeFizzCertVerifier(
       const TLSParams& params);
 
@@ -102,8 +114,15 @@ class HTTPCoroConnector {
     folly::SocketOptionMap socketOptions{folly::emptySocketOptionMap};
     folly::SocketAddress bindAddr{folly::AsyncSocket::anyAddress()};
 
-    // TLS Params
-    std::string serverName; // SNI
+    /**
+     * `serverName` indicates the DNS hostname associated with this connection.
+     *
+     * A non-empty `serverName` sends this as the server_name extension for
+     * TLS.
+     *
+     * If the original URL hostname is an IP address, this should not be set.
+     */
+    std::string serverName;
 
     // TLS connections must supply either an sslContext or a fizzContext
     FizzContextAndVerifier fizzContextAndVerifier;
@@ -120,6 +139,12 @@ class HTTPCoroConnector {
 
     // Next protocol for plaintext (TCP) connections
     std::string plaintextProtocol;
+
+    // INSECURE: Disables identity verification on server presented end entity
+    // certificates
+    bool insecureSkipIdentityValidation{true};
+
+    CertVerifyLogFn certVerifyLogFn;
   };
 
   static const ConnectionParams& defaultConnectionParams() {
@@ -159,7 +184,7 @@ class HTTPCoroConnector {
     return params;
   }
 
-  static folly::coro::Task<HTTPCoroSession*> connect(
+  static folly::coro::Task<CoroSessionHandle> connect(
       folly::EventBase* evb,
       folly::SocketAddress serverAddr,
       std::chrono::milliseconds timeout,
@@ -168,7 +193,7 @@ class HTTPCoroConnector {
 
   static constexpr std::chrono::milliseconds kHappyEyeballsDelay{150};
 
-  static folly::coro::Task<HTTPCoroSession*> happyEyeballsConnect(
+  static folly::coro::Task<CoroSessionHandle> happyEyeballsConnect(
       folly::EventBase* evb,
       folly::SocketAddress primaryAddr,
       folly::SocketAddress fallbackAddr,
@@ -178,8 +203,8 @@ class HTTPCoroConnector {
       std::chrono::milliseconds happyEyeballsTimeout = kHappyEyeballsDelay);
 
   // For HTTP connections over HTTP CONNECT
-  static folly::coro::Task<HTTPCoroSession*> proxyConnect(
-      HTTPCoroSession* proxySession,
+  static folly::coro::Task<CoroSessionHandle> proxyConnect(
+      CoroSessionHandle proxySession,
       HTTPCoroSession::RequestReservation reservation,
       std::string authority,
       bool connectUnique,
@@ -187,7 +212,7 @@ class HTTPCoroConnector {
       const ConnectionParams& connParams = defaultConnectionParams(),
       const SessionParams& sessionParams = defaultSessionParams());
 
-  static folly::coro::Task<HTTPCoroSession*> connect(
+  static folly::coro::Task<CoroSessionHandle> connect(
       folly::EventBase* evb,
       folly::SocketAddress serverAddr,
       std::chrono::milliseconds timeout,

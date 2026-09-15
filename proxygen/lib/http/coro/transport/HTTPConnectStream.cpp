@@ -12,10 +12,11 @@
 namespace proxygen::coro {
 
 HTTPConnectStream::HTTPConnectStream(Ownership ownership,
-                                     HTTPCoroSession* session,
+                                     CoroSessionHandle session,
                                      RequestHeaderMap connectHeaders,
                                      size_t egressBufferSize)
-    : session_(ownership == Ownership::Unique ? session : nullptr),
+    : session_(ownership == Ownership::Unique ? session
+                                              : CoroSessionHandle(nullptr)),
       eventBase_(session->getEventBase()),
       egressBufferSize_(egressBufferSize),
       egressSource_(new HTTPStreamSource(
@@ -41,7 +42,7 @@ HTTPConnectStream::~HTTPConnectStream() {
 }
 
 folly::coro::Task<std::unique_ptr<HTTPConnectStream>>
-HTTPConnectStream::connect(HTTPCoroSession* session,
+HTTPConnectStream::connect(CoroSessionHandle session,
                            HTTPCoroSession::RequestReservation reservation,
                            std::string authority,
                            std::chrono::milliseconds timeout,
@@ -56,7 +57,7 @@ HTTPConnectStream::connect(HTTPCoroSession* session,
 
 folly::coro::Task<std::unique_ptr<HTTPConnectStream>>
 HTTPConnectStream::connectUnique(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     std::string authority,
     std::chrono::milliseconds timeout,
@@ -70,7 +71,7 @@ HTTPConnectStream::connectUnique(
 }
 
 folly::coro::Task<void> HTTPConnectStream::connectImpl(
-    HTTPCoroSession* session,
+    CoroSessionHandle session,
     HTTPCoroSession::RequestReservation reservation,
     std::string authority,
     std::chrono::milliseconds timeout) {
@@ -114,6 +115,10 @@ folly::coro::Task<void> HTTPConnectStream::connectImpl(
                   << upstreamAddress << " err=" << ex.what();
       }
     }
+    // fwdproxy echoes its per-connection request id here; capture it for
+    // request<->egress-log correlation.
+    userSessionId_ = headerEvent.headers->getHeaders().getSingleOrEmpty(
+        "X-FB-Fwdproxy-Request-ID");
     break; // meh
   }
   // Successfully connected!

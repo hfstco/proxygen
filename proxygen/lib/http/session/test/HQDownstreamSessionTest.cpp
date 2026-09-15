@@ -37,6 +37,8 @@ using HQDownstreamSessionTestDeliveryAck = HQDownstreamSessionTest;
 
 // Use this test class for h3 server push tests
 using HQDownstreamSessionTestPush = HQDownstreamSessionTest;
+// Use this test class for h3 downstream datagram tests
+using HQDownstreamSessionTestDatagram = HQDownstreamSessionTest;
 
 namespace {
 HTTPMessage getProgressiveGetRequest() {
@@ -307,6 +309,27 @@ TEST_P(HQDownstreamSessionTest, SimpleGet) {
   // Checks that the server response is sent using the QPACK dynamic table
   CHECK_GE(qpackCodec_.getCompressionInfo().ingress.headerTableSize_, 0);
   hqSession_->closeWhenIdle();
+}
+
+TEST_P(HQDownstreamSessionTest, SlowConsumerDropsSession) {
+  hqSession_->setSlowConsumerParams(
+      /*queueThresholdBytes=*/1024,
+      /*minDequeueBytes=*/1000000,
+      /*window=*/milliseconds(1));
+
+  auto id = sendRequest();
+  socketDriver_->setStreamFlowControlWindow(id, 0);
+  socketDriver_->setConnectionFlowControlWindow(0);
+
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM([&handler] { handler->sendReplyWithBody(200, 8192); });
+  handler->expectError([](const HTTPException& ex) {
+    EXPECT_EQ(ex.getProxygenError(), kErrorDropped);
+  });
+  handler->expectDetachTransaction();
+
+  flushRequestsAndLoop();
 }
 
 TEST_P(HQDownstreamSessionTest, PriorityUpdateIntoTransport) {
@@ -1817,7 +1840,12 @@ TEST_P(HQDownstreamSessionTest, TransportInfo) {
   EXPECT_CALL(*socketDriver_->getSocket(), getTransportInfo())
       .Times(3)
       .WillRepeatedly(Return(quicInfo));
+  quic::Handshake::TLSSummary tlsSummary;
+  tlsSummary.version = 0x0304;
+  EXPECT_CALL(*socketDriver_->getSocket(), getTLSSummary())
+      .WillRepeatedly(Return(tlsSummary));
   hqSession_->getCurrentTransportInfoWithoutUpdate(&transInfo);
+  EXPECT_EQ(0x0304, transInfo.sslVersion);
   EXPECT_EQ(135, transInfo.rtt.count());
   EXPECT_EQ(246, transInfo.rtt_var);
   EXPECT_EQ(5, transInfo.cwnd);
@@ -2026,6 +2054,74 @@ TEST_P(HQDownstreamSessionTest, ConnectUDP) {
   request.readEOF = true;
   flushRequestsAndLoop();
   hqSession_->closeWhenIdle();
+}
+
+TEST_P(HQDownstreamSessionTestDatagram, BufferedDatagramDeliveredAfter2xx) {
+  CHECK(httpCallbacks_.datagramEnabled);
+  auto handler = addSimpleStrictHandler();
+  HTTPMessage req;
+  req.setURL("/");
+  req.setMethod(HTTPMethod::CONNECT);
+  req.setUpgradeProtocol("connect-udp");
+  handler->expectHeaders();
+  auto id = sendRequest(req, /*eom=*/false);
+  flushRequestsAndLoopN(1);
+
+  // datagrams received prior to sending 2xx are buffered
+  EXPECT_TRUE(handler->txn_->isUpgradePending());
+  EXPECT_GT(handler->txn_->getDatagramSizeLimit(), 0);
+  socketDriver_->addDatagram(
+      getH3Datagram(id, folly::IOBuf::copyBuffer("testtest")));
+  socketDriver_->addDatagramsAvailableReadEvent();
+  flushRequestsAndLoopN(1);
+
+  // non-final headers => still buffered
+  EXPECT_CALL(*handler, _onDatagram(_)).Times(0);
+  handler->sendHeaders(100, 0);
+  flushRequestsAndLoopN(1);
+  EXPECT_TRUE(handler->txn_->isUpgradePending());
+
+  // 2xx final headers => deliver buffered datagrams
+  EXPECT_CALL(*handler, _onDatagram(_)).WillOnce(Invoke([](auto dg) {
+    dg->trimStart(1); // ignore ctx-id
+    EXPECT_EQ(dg->toString(), "testtest");
+  }));
+  handler->sendHeaders(200, 0);
+  EXPECT_TRUE(handler->txn_->isUpgradeComplete());
+  flushRequestsAndLoopN(1);
+
+  handler->sendEOM();
+  handler->expectError();
+  handler->expectDetachTransaction();
+  hqSession_->dropConnection();
+}
+
+TEST_P(HQDownstreamSessionTestDatagram, BufferedDatagramDroppedOnNon2xx) {
+  CHECK(httpCallbacks_.datagramEnabled);
+  auto handler = addSimpleStrictHandler();
+
+  HTTPMessage req;
+  req.setURL("/");
+  req.setMethod(HTTPMethod::CONNECT);
+  req.setUpgradeProtocol("connect-udp");
+  handler->expectHeaders();
+  auto id = sendRequest(req, /*eom=*/false);
+  flushRequestsAndLoopN(1);
+
+  EXPECT_GT(handler->txn_->getDatagramSizeLimit(), 0);
+  socketDriver_->addDatagram(
+      getH3Datagram(id, folly::IOBuf::copyBuffer("testtest")));
+  socketDriver_->addDatagramsAvailableReadEvent();
+  flushRequestsAndLoopN(1);
+
+  EXPECT_CALL(*handler, _onDatagram(_)).Times(0);
+  handler->sendHeaders(400, 0);
+  flushRequestsAndLoopN(1);
+
+  handler->sendEOM();
+  handler->expectError();
+  handler->expectDetachTransaction();
+  hqSession_->dropConnection();
 }
 
 // Just open a stream and send nothing
@@ -2375,6 +2471,22 @@ TEST_P(HQDownstreamSessionBeforeTransportReadyTest, NotifyPendingShutdown) {
   EXPECT_EQ(httpCallbacks_.goaways, 2);
   EXPECT_THAT(httpCallbacks_.goawayStreamIds,
               ElementsAre(kMaxClientBidiStreamId, 0));
+}
+
+TEST_P(HQDownstreamSessionBeforeTransportReadyTest,
+       WriteCipherAvailableCreatesH3ControlStreams) {
+  hqSession_->onWriteCipherAvailable();
+  eventBase_.loopOnce();
+
+  const std::vector<quic::StreamId> expectedControlStreams = {3, 7, 11};
+  for (auto id : expectedControlStreams) {
+    EXPECT_NE(socketDriver_->streams_.find(id), socketDriver_->streams_.end());
+  }
+  EXPECT_GT(socketDriver_->getNumWriteChainInvocations(3), 0);
+
+  SetUpOnTransportReady();
+  hqSession_->closeWhenIdle();
+  eventBase_.loopOnce();
 }
 
 // NOTE: a failure for this test may cause an infinite loop in processReadData
@@ -2960,6 +3072,16 @@ INSTANTIATE_TEST_SUITE_P(HQDownstreamSessionTest,
                          Values([] {
                            TestParams tp;
                            tp.alpn_ = "h3";
+                           return tp;
+                         }()),
+                         paramsToTestName);
+
+INSTANTIATE_TEST_SUITE_P(HQDownstreamSessionTest,
+                         HQDownstreamSessionTestDatagram,
+                         Values([] {
+                           TestParams tp;
+                           tp.alpn_ = "h3";
+                           tp.datagrams_ = true;
                            return tp;
                          }()),
                          paramsToTestName);

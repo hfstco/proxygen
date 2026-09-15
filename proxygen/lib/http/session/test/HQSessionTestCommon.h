@@ -129,7 +129,7 @@ class HQSessionTest
       egressSettings_.setSetting(proxygen::SettingsId::ENABLE_CONNECT_PROTOCOL,
                                  1);
       egressSettings_.setSetting(proxygen::SettingsId::ENABLE_WEBTRANSPORT, 1);
-      egressSettings_.setSetting(proxygen::SettingsId::WT_ENABLED, 1);
+      egressSettings_.setSetting(proxygen::SettingsId::H3_WT_ENABLED, 1);
       egressSettings_.setSetting(proxygen::SettingsId::WT_INITIAL_MAX_DATA,
                                  65536);
     }
@@ -399,7 +399,8 @@ class HQSessionTest
     //   [Context ID (i)],
     //   HTTP/3 Datagram Payload (..),
     // }
-    quic::BufPtr headerBuf = quic::BufPtr(folly::IOBuf::create(0));
+    quic::BufPtr headerBuf =
+        quic::BufPtr(folly::IOBuf::create(proxygen::kMaxDatagramHeaderSize));
     quic::BufAppender appender(headerBuf.get(),
                                proxygen::kMaxDatagramHeaderSize);
     auto streamIdRes = quic::encodeQuicInteger(

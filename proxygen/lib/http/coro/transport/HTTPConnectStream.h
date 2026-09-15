@@ -45,7 +45,7 @@ class HTTPConnectStream
    * (eg: HTTPCoroSessionPool).
    */
   static folly::coro::Task<std::unique_ptr<HTTPConnectStream>> connect(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       std::string authority,
       std::chrono::milliseconds timeout,
@@ -57,7 +57,7 @@ class HTTPConnectStream
    * called.
    */
   static folly::coro::Task<std::unique_ptr<HTTPConnectStream>> connectUnique(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       std::string authority,
       std::chrono::milliseconds timeout,
@@ -77,31 +77,36 @@ class HTTPConnectStream
   void shutdownRead();
   void shutdownWrite();
 
-  HTTPCoroSession* session_{nullptr};
+  const std::string& extractUserSessionId() const {
+    return userSessionId_;
+  }
+
+  CoroSessionHandle session_{nullptr};
   folly::EventBase* eventBase_;
   size_t egressBufferSize_;
   HTTPStreamSource* egressSource_{nullptr};
   std::shared_ptr<HTTPSourceHolder> ingressSource_;
   folly::SocketAddress localAddr_;
   folly::SocketAddress peerAddr_;
+  std::string userSessionId_;
   folly::Optional<HTTPError> egressError_;
 
  private:
   enum class Ownership { Unique, Shared };
   HTTPConnectStream(Ownership ownership,
-                    HTTPCoroSession* session,
+                    CoroSessionHandle session,
                     RequestHeaderMap connectHeaders,
                     size_t egressBufferSize);
 
   folly::coro::Task<void> connectImpl(
-      HTTPCoroSession* session,
+      CoroSessionHandle session,
       HTTPCoroSession::RequestReservation reservation,
       std::string authority,
       std::chrono::milliseconds timeout);
 
   /* HTTPCoroSession::InfoCallback overrides */
   void onDestroy(const HTTPCoroSession& /*sess*/) override {
-    session_ = nullptr;
+    session_ = CoroSessionHandle(nullptr);
   }
 
   /* HTTPStreamSource::Callback overrides */

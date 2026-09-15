@@ -334,20 +334,22 @@ const folly::SocketAddress& HQSession::getPeerAddress() const noexcept {
                                        cachedPeerAddr_);
 }
 
-bool HQSession::onTransportReadyCommon() noexcept {
+bool HQSession::onWriteCipherAvailableCommon() noexcept {
+  if (writeCipherAvailableNotified_) {
+    return !writeCipherAvailableFailed_;
+  }
+  writeCipherAvailableNotified_ = true;
+
   localAddr_ = quic::toFollySocketAddress(sock_->getLocalAddress());
   peerAddr_ = quic::toFollySocketAddress(sock_->getPeerAddress());
   initQuicProtocolInfo(*quicInfo_, *sock_);
   // NOTE: this can drop the connection if the next protocol is not supported
   if (!getAndCheckApplicationProtocol()) {
+    writeCipherAvailableFailed_ = true;
     return false;
   }
-  transportInfo_.acceptTime = getCurrentTime();
-  getCurrentTransportInfoWithoutUpdate(&transportInfo_);
-  transportInfo_.setupTime = millisecondsSince(transportStart_);
-  transportInfo_.connectLatency = millisecondsSince(transportStart_).count();
-  transportInfo_.protocolInfo = quicInfo_;
   if (!createEgressControlStreams()) {
+    writeCipherAvailableFailed_ = true;
     return false;
   }
   // Apply the default settings
@@ -361,12 +363,30 @@ bool HQSession::onTransportReadyCommon() noexcept {
   sock_->setPingCallback(this);
   if (earlyDataHandler_ && earlyDataHandler_->hasSettings()) {
     // Apply cached peer settings from 0-RTT session ticket.
-    // hasSettings() is true when validate() successfully parsed cached settings
-    // from the ticket. Old tickets without app params won't have settings.
+    // hasSettings() is true when validate() successfully parsed cached
+    // settings from the ticket. Old tickets without app params won't have
+    // settings.
     applySettings(earlyDataHandler_->getSettings().getAllSettings());
   } else {
     applySettings(defaultSettings);
   }
+
+  return true;
+}
+
+bool HQSession::onTransportReadyCommon() noexcept {
+  if (!onWriteCipherAvailableCommon()) {
+    return false;
+  }
+  // localAddr_/peerAddr_/quicInfo_ are populated by
+  // onWriteCipherAvailableCommon() above (inline here on the legacy/client
+  // path, or earlier at write-cipher availability on the retimed server
+  // path); don't re-fetch them.
+  transportInfo_.acceptTime = getCurrentTime();
+  getCurrentTransportInfoWithoutUpdate(&transportInfo_);
+  transportInfo_.setupTime = millisecondsSince(transportStart_);
+  transportInfo_.connectLatency = millisecondsSince(transportStart_).count();
+  transportInfo_.protocolInfo = quicInfo_;
   // notifyPendingShutdown may be invoked before onTransportReady,
   // so we need to address that here by kicking the GOAWAY logic if needed
   if (drainState_ == DrainState::PENDING) {
@@ -476,8 +496,9 @@ bool HQSession::getAndCheckApplicationProtocol() {
   if (!alpn || !version_) {
     // next protocol not specified or version not supported, close connection
     // with error
+    static const std::string kNoProtocol = "no protocol";
     LOG(ERROR) << "next protocol not supported: "
-               << (alpn ? *alpn : "no protocol") << " sess=" << *this;
+               << (alpn ? *alpn : kNoProtocol) << " sess=" << *this;
 
     onConnectionError(quic::QuicError(quic::LocalErrorCode::CONNECT_FAILED,
                                       "ALPN not supported"));
@@ -615,9 +636,12 @@ bool HQSession::getCurrentTransportInfoWithoutUpdate(
 
     // Populate key exchange algorithm if available
     auto tlsSummary = sock_->getTLSSummary();
-    if (tlsSummary && !tlsSummary->namedGroup.empty()) {
-      tinfo->keyExchange =
-          std::make_shared<std::string>(tlsSummary->namedGroup);
+    if (tlsSummary) {
+      tinfo->sslVersion = tlsSummary->version;
+      if (!tlsSummary->namedGroup.empty()) {
+        tinfo->keyExchange =
+            std::make_shared<std::string>(tlsSummary->namedGroup);
+      }
     }
   }
   // TODO: fill up other properties.
@@ -2017,6 +2041,7 @@ size_t HQSession::handleWrite(WriteFunc writeFunc,
     hqStream->pendingEOM_ = false;
   }
   hqStream->bytesWritten_ += sent;
+  onBodyBytesWritten(sent);
   // hqStream's byteEventTracker cannot be changed, so no need to pass
   // shared_ptr or use in while loop
   hqStream->byteEventTracker_.processByteEvents(
@@ -2610,7 +2635,8 @@ void HQSession::HQStreamTransportBase::onHeadersComplete(
 
   // Inform observers when request headers (i.e. ingress, from downstream
   // client) are processed.
-  if (isDownstream(session_.direction_)) {
+  const bool downstream = isDownstream(session_.direction_);
+  if (downstream) {
     if (msg.get()) {
       const auto event =
           HTTPSessionObserverInterface::RequestStartedEvent::Builder()
@@ -2688,6 +2714,7 @@ void HQSession::HQStreamTransportBase::onHeadersComplete(
   // the current transaction (no push promise) or to a freshly created
   // pushed transaction. The latter is done via "onPushPromiseHeadersComplete"
   // callback
+  const bool isResp = msg->isResponse();
   if (ingressPushId_) {
     onPushPromiseHeadersComplete(*ingressPushId_, streamID, std::move(msg));
     ingressPushId_ = folly::none;
@@ -2699,17 +2726,8 @@ void HQSession::HQStreamTransportBase::onHeadersComplete(
     httpSessionActivityTracker->reportActivity();
   }
 
-  // The stream can now receive datagrams: check for any pending datagram and
-  // deliver it to the handler
-  if (session_.datagramEnabled_ && !session_.datagramsBuffer_.empty()) {
-    auto itr = session_.datagramsBuffer_.find(streamId);
-    if (itr != session_.datagramsBuffer_.end()) {
-      auto& vec = itr->second;
-      for (auto& datagram : vec) {
-        txn_.onDatagram(std::move(datagram));
-      }
-      session_.datagramsBuffer_.erase(itr);
-    }
+  if (!downstream && isResp) {
+    onResponse();
   }
 }
 
@@ -2940,6 +2958,9 @@ void HQSession::HQStreamTransportBase::sendHeaders(HTTPTransaction* txn,
   }
 
   tryWtSession(*txn, headers, includeEOM);
+  if (!upstream && headers.isResponse()) {
+    onResponse();
+  }
 }
 
 size_t HQSession::HQStreamTransportBase::sendEOM(
@@ -3480,36 +3501,10 @@ void HQSession::HQStreamTransportBase::onByteEventCanceled(
 }
 
 // Methods specific to StreamTransport subclasses
-void HQSession::HQStreamTransportBase::onPushMessageBegin(
-    HTTPCodec::StreamID pushID,
-    HTTPCodec::StreamID assocStreamID,
-    HTTPMessage* /* msg */) {
-  VLOG(4) << __func__ << " txn=" << txn_ << " streamID=" << getIngressStreamId()
-          << " assocStreamID=" << assocStreamID
-          << " ingressPushId=" << ingressPushId_.value_or(-1);
-
-  if (ingressPushId_) {
-    constexpr auto error =
-        "Received onPushMessageBegin in the middle of push promise";
-    LOG(ERROR) << error;
-    // TODO: Audit this error code
-    session_.dropConnectionAsync(
-        quic::QuicError(HTTP3::ErrorCode::HTTP_FRAME_ERROR, error),
-        kErrorDropped);
-    return;
-  }
-
-  if (session_.infoCallback_) {
-    session_.infoCallback_->onRequestBegin(session_);
-  }
-
-  // Notify the testing callbacks
-  if (session_.serverPushLifecycleCb_) {
-    session_.serverPushLifecycleCb_->onPushPromiseBegin(
-        assocStreamID, static_cast<hq::PushId>(pushID));
-  }
-
-  ingressPushId_ = static_cast<hq::PushId>(pushID);
+void HQSession::HQStreamTransportBase::onPushMessageBegin(HTTPCodec::StreamID,
+                                                          HTTPCodec::StreamID,
+                                                          HTTPMessage*) {
+  // http/3 push in proxygen/lib is not supported
 }
 
 HQSession::HQStreamTransportBase* HQSession::findWTSessionOrAbort(
@@ -3646,48 +3641,19 @@ HQSession::HQStreamTransport::newPushedTransaction(
 }
 
 void HQSession::HQStreamTransport::onPushPromiseHeadersComplete(
-    hq::PushId pushID,
-    HTTPCodec::StreamID assocStreamID,
-    std::unique_ptr<HTTPMessage> msg) {
-  VLOG(4) << "processing new Push Promise msg=" << msg.get()
-          << " streamID=" << assocStreamID << " maybePushID=" << pushID
-          << ", txn= " << txn_;
-
-  // Notify the testing callbacks
-  if (session_.serverPushLifecycleCb_) {
-    session_.serverPushLifecycleCb_->onPushPromise(
-        assocStreamID, pushID, msg.get());
-  }
-
-  // Create ingress push stream (will also create the transaction)
-  // If a corresponding nascent push stream is ready, it will be
-  // bound to the newly created stream.
-  // virtual function call into UpstreamSession.  This will crash if it happens
-  // downstream.
-  auto pushStream = session_.createIngressPushStream(assocStreamID, pushID);
-  CHECK(pushStream);
-
-  // Notify the *parent* transaction that the *pushed* transaction has been
-  // successfully created.
-  txn_.onPushedTransaction(&pushStream->txn_);
-
-  // Notify the *pushed* transaction on the push promise headers
-  // This has to be called AFTER "onPushedTransaction" upcall
-  pushStream->txn_.onIngressHeadersComplete(std::move(msg));
+    hq::PushId, HTTPCodec::StreamID, std::unique_ptr<HTTPMessage>) {
 }
 
 void HQSession::onDatagramsAvailable() noexcept {
   auto result = sock_->readDatagramBufs();
   if (result.hasError()) {
-    LOG(ERROR) << "Got error while reading datagrams: error="
-               << toString(result.error());
+    LOG(ERROR) << "::readDatagramBufs err=" << toString(result.error());
     dropConnectionAsync(quic::QuicError(HTTP3::ErrorCode::HTTP_INTERNAL_ERROR,
                                         "H3_DATAGRAM: internal error "),
                         kErrorConnection);
     return;
   }
-  VLOG(4) << "Received " << result.value().size()
-          << " datagrams. sess=" << *this;
+  VLOG(4) << "nDatagrams=" << result.value().size() << " sess=" << *this;
   for (auto& datagram : result.value()) {
     folly::io::Cursor cursor(datagram.get());
     auto quarterStreamId = quic::follyutils::decodeQuicInteger(cursor);
@@ -3698,26 +3664,20 @@ void HQSession::onDatagramsAvailable() noexcept {
           kErrorConnection);
       break;
     }
-    auto streamId = quarterStreamId->first * 4;
-    auto stream = findNonDetachedStream(streamId);
-    quic::Optional<std::pair<uint64_t, size_t>> ctxId;
-    if (!stream || (!stream->txn_.isWebTransportConnectStream() &&
-                    !stream->txn_.isConnectUdpStream())) {
-      // TODO: draft 8 and rfc don't include context ID
-      ctxId = quic::follyutils::decodeQuicInteger(cursor);
-      if (!ctxId) {
-        dropConnectionAsync(
-            quic::QuicError(HTTP3::ErrorCode::HTTP_GENERAL_PROTOCOL_ERROR,
-                            "H3_DATAGRAM: error decoding context-id"),
-            kErrorConnection);
-      }
-    }
-    quic::BufQueue datagramQ;
-    datagramQ.append(std::move(datagram));
-    datagramQ.trimStart(quarterStreamId->second + (ctxId ? ctxId->second : 0));
+    const uint64_t streamId = quarterStreamId->first * 4;
+    auto* stream = findNonDetachedStream(streamId);
+    quic::BufQueue datagramQ{std::move(datagram)};
+    datagramQ.trimStart(quarterStreamId->second);
 
-    if (!stream || !stream->hasHeaders_) {
-      VLOG(4) << "Stream cannot receive datagrams yet. streamId=" << streamId
+    /**
+     * we should buffer if any of the following hold:
+     *  - stream doesn't exist
+     *  - upstream txn hasn't received 2xx headers yet
+     *  - downstream txn hasn't sent 2xx headers yet
+     */
+    const bool shouldBuffer = !stream || stream->txn_.isUpgradePending();
+    if (shouldBuffer) {
+      VLOG(4) << "buffering dgram streamId=" << streamId
               << " len=" << datagramQ.chainLength() << " sess=" << *this;
       // TODO: a possible optimization would be to discard datagrams destined
       // to streams that were already closed
@@ -3735,14 +3695,9 @@ void HQSession::onDatagramsAvailable() noexcept {
       continue;
     }
 
-    VLOG(4) << "Received datagram for streamId=" << streamId << " ctx="
-            << (ctxId ? folly::to<std::string>(ctxId->first) : std::string())
-            << " len=" << datagramQ.chainLength() << " sess=" << *this;
-    if (stream->wtSess_) {
-      // refresh ingress timeout
-      stream->txn_.refreshTimeout();
-      stream->wtSess_->onDatagram(datagramQ.move());
-    } else {
+    if (stream->txn_.isUpgradeComplete()) {
+      VLOG(4) << "Received datagram for streamId=" << streamId
+              << " len=" << datagramQ.chainLength() << " sess=" << *this;
       stream->txn_.onDatagram(datagramQ.move());
     }
   }
@@ -4002,6 +3957,41 @@ bool HQSession::HQStreamTransportBase::tryWtSession(HTTPTransaction& txn,
   // alias shared_ptr
   wtSess_ = std::shared_ptr<H3WtSession>(wtSess, &wtSess->getH3WtSession());
   return true;
+}
+
+void HQSession::HQStreamTransportBase::onResponse() noexcept {
+  /**
+   * If upgradeCompleted (i.e. a downstream txn sends 2xx or an upstream txn
+   * receives 2xx) and there are pending datagrams, attempt to deliver them to
+   * the handler. This is done in the next evb loop since this may be invoked in
+   * the egress path (i.e. downstream ::sendHeaders) and we shouldn't be
+   * invoking ingress callbacks inline from the egress path.
+   */
+  auto& datagrams = session_.datagramsBuffer_;
+  VLOG(4) << "nDatagrams=" << datagrams.size()
+          << "; upgradeStatus=" << int(txn_.getUpgradeStatus());
+  if (datagrams.empty()) { // nothing to do
+    return;
+  }
+  using UpgradeStatus = HTTPTransaction::UpgradeStatus;
+  if (txn_.isUpgradeComplete()) { // successfully upgraded
+    datagramScheduler_.schedule(session_.getEventBase());
+  } else if (txn_.getUpgradeStatus() == UpgradeStatus::None) {
+    datagrams.erase(getStreamId());
+  } // else: upgrade pending
+}
+
+void HQSession::HQStreamTransportBase::DatagramScheduler::
+    deliverBufferedDatagrams() noexcept {
+  auto& datagramsBuffer = stream.session_.datagramsBuffer_;
+  auto it = datagramsBuffer.find(stream.getStreamId());
+  if (it != datagramsBuffer.end()) {
+    auto datagrams = std::move(it->second);
+    for (auto& datagram : datagrams) {
+      stream.txn_.onDatagram(std::move(datagram));
+    }
+    datagramsBuffer.erase(it);
+  }
 }
 
 std::ostream& operator<<(std::ostream& os, const HQSession& session) {
