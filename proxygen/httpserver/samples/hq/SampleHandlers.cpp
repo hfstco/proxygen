@@ -394,6 +394,7 @@ void DeviousBatonHandler::readHandler(
     folly::Try<WebTransport::StreamData> streamData) {
   if (streamData.hasException()) {
     VLOG(4) << "read error=" << streamData.exception().what();
+    streams_.erase(id);
     return;
   }
 
@@ -403,6 +404,7 @@ void DeviousBatonHandler::readHandler(
       id, streams_[id], std::move(streamData->data), streamData->fin);
   if (!readHandle) {
     // terminal event (fin or exception), handle is no longer valid
+    streams_.erase(id);
     return;
   }
   if (!readHandle->getCancelToken().isCancellationRequested()) {

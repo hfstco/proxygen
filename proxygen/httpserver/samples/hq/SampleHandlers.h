@@ -780,11 +780,18 @@ constexpr auto kPushFileName = "pusheen.txt";
 
 class ServerPushHandler : public BaseSampleHandler {
   class ServerPushTxnHandler : public proxygen::HTTPPushTransactionHandler {
+   public:
+    explicit ServerPushTxnHandler(ServerPushHandler& parent)
+        : parent_(parent) {
+    }
+
     void setTransaction(
-        proxygen::HTTPTransaction* /* txn */) noexcept override {
+        proxygen::HTTPTransaction* /*txn*/) noexcept override {
+      parent_.onPushTransactionAttached();
     }
 
     void detachTransaction() noexcept override {
+      parent_.onPushTransactionDetached();
     }
 
     void onError(const proxygen::HTTPException& /* err */) noexcept override {
@@ -795,11 +802,14 @@ class ServerPushHandler : public BaseSampleHandler {
 
     void onEgressResumed() noexcept override {
     }
+
+   private:
+    ServerPushHandler& parent_;
   };
 
  public:
   explicit ServerPushHandler(const HandlerParams& params)
-      : BaseSampleHandler(params) {
+      : BaseSampleHandler(params), pushTxnHandler_(*this) {
   }
 
   void onHeadersComplete(
@@ -812,9 +822,27 @@ class ServerPushHandler : public BaseSampleHandler {
   void onError(const proxygen::HTTPException& /*error*/) noexcept override;
 
   void detachTransaction() noexcept override {
+    transactionDetached_ = true;
+    maybeDelete();
   }
 
  private:
+  void onPushTransactionAttached() {
+    ++pushTransactions_;
+  }
+
+  void onPushTransactionDetached() {
+    CHECK_GT(pushTransactions_, 0);
+    --pushTransactions_;
+    maybeDelete();
+  }
+
+  void maybeDelete() {
+    if (transactionDetached_ && pushTransactions_ == 0) {
+      delete this;
+    }
+  }
+
   void sendPushPromise(proxygen::HTTPTransaction* /* pushTxn */,
                        const std::string& /* path */);
 
@@ -829,6 +857,8 @@ class ServerPushHandler : public BaseSampleHandler {
 
   std::string path_;
   ServerPushTxnHandler pushTxnHandler_;
+  size_t pushTransactions_{0};
+  bool transactionDetached_{false};
 };
 
 class DeviousBatonHandler : public BaseSampleHandler {
@@ -860,6 +890,12 @@ class DeviousBatonHandler : public BaseSampleHandler {
   void onError(const proxygen::HTTPException& /*error*/) noexcept override;
 
   void detachTransaction() noexcept override {
+    txn_ = nullptr;
+    // onHeadersComplete may already have queued devious_->start() for the next
+    // loop iteration.  WebTransport guarantees all stream callbacks have
+    // completed before detachTransaction, so deferring destruction by one
+    // turn covers both kinds of asynchronous work.
+    evb_->runInLoop([this] { delete this; });
   }
 
   folly::Optional<devious::DeviousBaton> devious_;

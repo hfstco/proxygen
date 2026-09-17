@@ -86,7 +86,16 @@ endif()
 if (NOT DEFINED wangle_SOURCE_DIR)
   find_package(wangle REQUIRED)
 endif()
-if (NOT DEFINED mvfst_SOURCE_DIR)
+set(PROXYGEN_MVFST_SOURCE_DIR "" CACHE PATH
+  "Path to an mvfst source checkout to build in-tree instead of using an \
+installed mvfst via find_package")
+# CMake cache variables survive reconfiguration, so mvfst_SOURCE_DIR may be
+# defined even when mvfst has not been added to this configure run. Check the
+# target instead to avoid skipping both add_subdirectory() and find_package().
+if (PROXYGEN_MVFST_SOURCE_DIR AND NOT TARGET mvfst::mvfst_transport)
+  add_subdirectory(${PROXYGEN_MVFST_SOURCE_DIR} mvfst)
+endif()
+if (NOT TARGET mvfst::mvfst_transport)
   find_package(mvfst REQUIRED)
 endif()
 find_package(Zstd REQUIRED)
