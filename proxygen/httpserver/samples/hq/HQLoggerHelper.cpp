@@ -17,7 +17,7 @@ HQLoggerHelper::HQLoggerHelper(const std::string& path,
                         quic::kHTTP3ProtocolType,
                         path,
                         pretty,
-                        false /* streaming */),
+                        true /* streaming */),
       outputPath_(path),
       pretty_(pretty) {
 }
